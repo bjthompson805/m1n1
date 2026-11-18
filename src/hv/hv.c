@@ -223,21 +223,25 @@ void hv_start(void *entry, u64 regs[4])
         return;
     }
 
+    printf("HVDBG: start\n"); iodev_console_flush(); // XXX M5 debug
     if (!hv_cpu_power_init()) {
         printf("HV: CPU power protection hooks failed; can't start the hypervisor\n");
         return;
     }
 
+    printf("HVDBG: power_init ok\n"); iodev_console_flush(); // XXX M5 debug
     if (!hv_amcc_init()) {
         printf("HV: AMCC interrupt hook failed; can't start the hypervisor\n");
         return;
     }
 
+    printf("HVDBG: amcc ok\n"); iodev_console_flush(); // XXX M5 debug
     if (!hv_cpu_state_setup_hook()) {
         printf("CPU state hook setup failed, can't start the hypervisor\n");
         return;
     }
 
+    printf("HVDBG: state hook ok\n"); iodev_console_flush(); // XXX M5 debug
     memset(hv_should_exit, 0, sizeof(hv_should_exit));
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
 
@@ -246,9 +250,11 @@ void hv_start(void *entry, u64 regs[4])
     msr(VMPIDR_EL2, mrs(MPIDR_EL1));
     msr(VBAR_EL1, _hv_vectors_start);
 
+    printf("HVDBG: vbar set\n"); iodev_console_flush(); // XXX M5 debug
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
 
+    printf("HVDBG: gxf ok\n"); iodev_console_flush(); // XXX M5 debug
     hv_secondary_info.hcr = mrs(HCR_EL2);
     hv_secondary_info.hacr = mrs(HACR_EL2);
     hv_secondary_info.vtcr = mrs(VTCR_EL2);
@@ -272,11 +278,14 @@ void hv_start(void *entry, u64 regs[4])
         hv_secondary_info.agt_cnt_rdir_el12 = mrs(SYS_IMP_APL_AGTCNTRDIR_EL12);
     }
 
+    printf("HVDBG: sysregs saved\n"); iodev_console_flush(); // XXX M5 debug
     hv_arm_tick(false);
+    printf("HVDBG: tick armed\n"); iodev_console_flush(); // XXX M5 debug
     hv_pinned_cpu = -1;
     hv_want_cpu = -1;
     hv_cpus_in_guest = BIT(smp_id());
 
+    printf("HVDBG: entering guest\n"); iodev_console_flush(); // XXX M5 debug
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
@@ -311,19 +320,31 @@ void hv_start(void *entry, u64 regs[4])
     spin_unlock(&bhl);
 }
 
+/* XXX M5 debug: last step a secondary reached in hv_init_secondary (uncached, MMU-off safe) */
+volatile u64 hv_secondary_crumb[MAX_CPUS] __attribute__((section(".data.smp_shared")));
+#define HV_CRUMB(n)                                                                                \
+    do {                                                                                           \
+        hv_secondary_crumb[smp_id()] = (n);                                                        \
+        sysop("dsb sy");                                                                           \
+    } while (0)
+
 static void hv_init_secondary(struct hv_secondary_info_t *info)
 {
+    HV_CRUMB(1);
     if (cpu_features->apple_sysregs_unlocked)
         gxf_init();
 
+    HV_CRUMB(2);
     msr(VMPIDR_EL2, mrs(MPIDR_EL1));
     msr(VBAR_EL1, _hv_vectors_start);
 
-    msr(HCR_EL2, info->hcr);
+    /* T8142 secondaries can't WFI without losing state (see ESR_EC_WFI in hv_exc.c) */
+    msr(HCR_EL2, info->hcr | (chip_id == T8142 ? HCR_TWI : 0));
     msr(HACR_EL2, info->hacr);
     msr(VTCR_EL2, info->vtcr);
     msr(VTTBR_EL2, info->vttbr);
     msr(MDCR_EL2, info->mdcr);
+    HV_CRUMB(3);
     msr(MDSCR_EL1, info->mdscr);
 
     if (cpu_features->apple_sysregs_unlocked) {
@@ -332,6 +353,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         msr(SYS_IMP_APL_APVMKEYHI_EL2, info->apvmkeyhi);
         msr(SYS_IMP_APL_APSTS_EL12, info->apsts);
     }
+    HV_CRUMB(4);
     msr(ACTLR_EL2, info->actlr_el2);
     if (cpu_features->actlr_el2)
         msr(SYS_ACTLR_EL12, info->actlr_el1);
@@ -343,33 +365,45 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         if (info->sprr_config & SPRR_CONFIG_EN)
             msr(SYS_IMP_APL_GXF_CONFIG_EL1, info->gxf_config);
     }
+    HV_CRUMB(5);
     if (cpu_features->counter_redirect) {
         msr(SYS_IMP_APL_AGTCNTRDIR_EL1, info->agt_cnt_rdir_el1);
         msr(SYS_IMP_APL_AGTCNTRDIR_EL12, info->agt_cnt_rdir_el12);
     }
 
+    HV_CRUMB(6);
     if (hv_sptm_mode == SPTM_NESTED_VIRT) {
         msr(VNCR_EL2, &nvMem[smp_id()]);
         msr(SYS_IMP_APL_AVNCR_EL2, &anvMem[smp_id()]);
     }
 
-    if (cpu_features->apple_sysregs_unlocked)
+    if (cpu_features->apple_sysregs_unlocked) {
         reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
+    }
 
+    HV_CRUMB(7);
     hv_enable_sme_zt0();
 
     // For M3 and up, CNTHCTL_EL2 must be written after the counter redirection
     sysop("isb");
+    HV_CRUMB(8);
     msr(CNTHCTL_EL2, info->cnthctl);
 
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
 
     hv_arm_tick(true);
+    HV_CRUMB(99);
 }
 
 static void hv_enter_secondary(void *entry, u64 regs[4])
 {
+    /*
+     * Mark the CPU as running a guest only now, from the CPU itself: until here it is parked in
+     * the host's WFE spin loop, where a rendezvous IPI must not reach it (T8142).
+     */
+    hv_started_cpus[smp_id()] = true;
+    __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
     spin_lock(&bhl);
@@ -390,18 +424,30 @@ void hv_start_secondary(int cpu, void *entry, u64 regs[4])
     if (hv_sptm_mode == SPTM_EMULATION)
         hv_sprr_init_secondary(cpu);
 
-    mmu_init_secondary(cpu);
+    if (!mmu_init_secondary_timeout(cpu, 2000000)) {
+        printf("HV: secondary %d: MMU setup call not taken (alive=%d)\n", cpu, smp_is_alive(cpu));
+        iodev_console_flush();
+        return;
+    }
     iodev_console_flush();
-    smp_call4(cpu, hv_init_secondary, (u64)&hv_secondary_info, 0, 0, 0);
-    smp_wait(cpu);
+    hv_secondary_crumb[cpu] = 0;
+    if (!smp_call4_timeout(cpu, hv_init_secondary, (u64)&hv_secondary_info, 0, 0, 0, 2000000,
+                           NULL)) {
+        printf("HV: secondary %d: hv_init_secondary stuck after crumb %ld\n", cpu,
+               hv_secondary_crumb[cpu]);
+        return;
+    }
     iodev_console_flush();
 
     printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
-    hv_started_cpus[cpu] = true;
-    __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);
 
     iodev_console_flush();
-    smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0);
+    if (!smp_take_call4_timeout(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0, 1000000)) {
+        printf("HV: secondary %d never entered the guest; leaving it out\n", cpu);
+        hv_started_cpus[cpu] = false;
+        __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(cpu), __ATOMIC_ACQUIRE);
+        iodev_console_flush();
+    }
 }
 
 void hv_exit_cpu(int cpu)
@@ -422,7 +468,8 @@ void hv_rendezvous(void)
 
     /* IPI all CPUs. This might result in spurious IPIs to the guest... */
     for (int i = 0; i < MAX_CPUS; i++) {
-        if (i != smp_id() && hv_started_cpus[i]) {
+        if (i != smp_id() && hv_started_cpus[i] &&
+            (__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE) & BIT(i))) {
             smp_send_ipi(i);
         }
     }
@@ -544,15 +591,27 @@ void hv_maybe_exit(void)
 
 void hv_tick(struct exc_info *ctx)
 {
+    static int dbg_ticks; // XXX M5 debug
+    bool dbg = dbg_ticks++ < 3;
+    if (dbg)
+        printf("HVDBG: tick %d: wdt_pet\n", dbg_ticks); iodev_console_flush();
     hv_wdt_pet();
+    if (dbg)
+        printf("HVDBG: tick: usb events\n"); iodev_console_flush();
     iodev_handle_events(uartproxy_iodev);
+    if (dbg)
+        printf("HVDBG: tick: can_read\n"); iodev_console_flush();
     if (iodev_can_read(uartproxy_iodev)) {
         printf("HV: User interrupt\n");
         iodev_console_flush();
         if (hv_pinned_cpu == -1 || hv_pinned_cpu == smp_id())
             hv_exc_proxy(ctx, START_HV, HV_USER_INTERRUPT, NULL);
     }
+    if (dbg)
+        printf("HVDBG: tick: vuart\n"); iodev_console_flush();
     hv_vuart_poll();
+    if (dbg)
+        printf("HVDBG: tick done\n"); iodev_console_flush();
 }
 
 bool hv_is_nested(void)

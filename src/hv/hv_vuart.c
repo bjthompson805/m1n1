@@ -103,6 +103,8 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 utrstat &= ~(*val & (UTRSTAT_TXTHRESH | UTRSTAT_RXTHRESH | UTRSTAT_RXTO));
                 break;
         }
+        /* A UCON/UTRSTAT write can change the IRQ state immediately (e.g. TX threshold enable) */
+        update_irq();
     } else {
         switch (addr) {
             case UCON:

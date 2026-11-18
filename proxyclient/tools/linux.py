@@ -15,6 +15,7 @@ parser.add_argument('-b', '--bootargs', type=str, metavar='"boot arguments"')
 parser.add_argument('-t', '--tty', type=str)
 parser.add_argument('-u', '--u-boot', type=pathlib.Path, help="load u-boot before linux")
 parser.add_argument('-E', '--efi', action="store_true", help="payload is EFI stub (requires u-boot)")
+parser.add_argument('--no-smp', action="store_true", help="do not start secondary CPUs")
 parser.add_argument('-T', '--tso', action="store_true", help="enable TSO")
 args = parser.parse_args()
 
@@ -110,7 +111,8 @@ if args.u_boot:
 
 
 p.cpufreq_init()
-p.smp_start_secondaries()
+if not args.no_smp:
+    p.smp_start_secondaries()
 
 if args.tso:
     print("Enabling TSO:")

@@ -25,6 +25,7 @@ struct hv_pcpu_data {
     u64 pmc_irq_mode;
     u64 exc_entry_pmcr0_cnt;
     u64 mdscr;
+    u32 tmr_hv_masked; /* VM_TMR_FIQ_ENA_ENA_{P,V}: guest timer IMASK forced by us */
 } ALIGNED(64);
 
 struct hv_pcpu_data pcpu[MAX_CPUS];
@@ -45,6 +46,10 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
                           void *extra)
 {
     int from_el = FIELD_GET(SPSR_M, ctx->spsr) >> 2;
+
+    // XXX M5 debug
+    printf("HVDBG: proxy reason=%d type=%d from EL%d esr=0x%lx elr=0x%lx far=0x%lx spsr=0x%lx\n",
+           reason, type, from_el, ctx->esr, ctx->elr, ctx->far, ctx->spsr); iodev_console_flush();
 
     hv_wdt_breadcrumb('P');
 
@@ -150,23 +155,67 @@ void hv_add_time(s64 time)
     stolen_time -= (u64)time;
 }
 
+/*
+ * Shadow IMASK handling for guest timers when VM_TMR_FIQ_ENA_EL2 can't be written. Returns
+ * whether the timer is firing from the guest's point of view.
+ */
+#define HV_TMR_SHADOW_UPDATE(ctl_reg, bit)                                                         \
+    ({                                                                                             \
+        u64 _ctl = mrs(ctl_reg);                                                                   \
+        bool _hvm = PERCPU(tmr_hv_masked) & (bit);                                                 \
+        bool _firing = (_ctl & (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) ==                            \
+                           (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE) &&                                 \
+                       (_hvm || !(_ctl & CNTx_CTL_IMASK));                                         \
+        if (_firing && !_hvm) {                                                                    \
+            msr(ctl_reg, _ctl | CNTx_CTL_IMASK);                                                   \
+            PERCPU(tmr_hv_masked) |= (bit);                                                        \
+        } else if (!_firing && _hvm) {                                                             \
+            msr(ctl_reg, _ctl & ~CNTx_CTL_IMASK);                                                  \
+            PERCPU(tmr_hv_masked) &= ~(bit);                                                       \
+        }                                                                                          \
+        _firing;                                                                                   \
+    })
+
+/* Guest access to a trapped CNTx_CTL_EL0, hiding an IMASK forced by HV_TMR_SHADOW_UPDATE */
+#define SYSREG_TMR_CTL(sr, to, bit)                                                                \
+    case SYSREG_ISS(sr):                                                                           \
+        if (is_read) {                                                                             \
+            regs[rt] = _mrs(sr_tkn(to));                                                           \
+            if (PERCPU(tmr_hv_masked) & (bit))                                                     \
+                regs[rt] &= ~CNTx_CTL_IMASK;                                                       \
+        } else {                                                                                   \
+            PERCPU(tmr_hv_masked) &= ~(bit);                                                       \
+            _msr(sr_tkn(to), regs[rt]);                                                            \
+        }                                                                                          \
+        return true;
+
 void hv_update_fiq(void)
 {
     u64 hcr = mrs(HCR_EL2);
     bool fiq_pending = false;
 
-    if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
-        fiq_pending = true;
-        reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+    if (cpu_features->vm_tmr_fiq_ena_ro) {
+        /*
+         * VM_TMR_FIQ_ENA_EL2 is read-only (M5), so a firing guest timer would keep raising
+         * physical FIQs at EL2. Mask it with its own IMASK instead, hidden from the guest
+         * by the trapped (ECV) CNTx_CTL accessors, and deliver a virtual FIQ.
+         */
+        fiq_pending |= HV_TMR_SHADOW_UPDATE(CNTP_CTL_EL02, VM_TMR_FIQ_ENA_ENA_P);
+        fiq_pending |= HV_TMR_SHADOW_UPDATE(CNTV_CTL_EL02, VM_TMR_FIQ_ENA_ENA_V);
     } else {
-        reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
-    }
+        if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+            fiq_pending = true;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+        } else {
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+        }
 
-    if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
-        fiq_pending = true;
-        reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
-    } else {
-        reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+        if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+            fiq_pending = true;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+        } else {
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+        }
     }
 
     fiq_pending |= PERCPU(ipi_pending) || PERCPU(pmc_pending);
@@ -210,6 +259,67 @@ void hv_pmcr0_write(u64 val)
             _msr(sr_tkn(sr), regs[rt]);                                                            \
         return true;
 
+/* Number of implemented breakpoints (op2 4/5) or watchpoints (op2 6/7) */
+static u64 hv_dbg_nbrps(u64 op2)
+{
+    u64 dfr0 = mrs(ID_AA64DFR0_EL1);
+    if (op2 < 6)
+        return FIELD_GET(GENMASK(15, 12), dfr0) + 1;
+    return FIELD_GET(GENMASK(23, 20), dfr0) + 1;
+}
+
+#define DBG_CASE(n)                                                                                \
+    case n:                                                                                        \
+        switch (op2) {                                                                             \
+            case 4:                                                                                \
+                if (is_read)                                                                       \
+                    *val = mrs(DBGBVR##n##_EL1);                                                   \
+                else                                                                               \
+                    msr(DBGBVR##n##_EL1, *val);                                                    \
+                break;                                                                             \
+            case 5:                                                                                \
+                if (is_read)                                                                       \
+                    *val = mrs(DBGBCR##n##_EL1);                                                   \
+                else                                                                               \
+                    msr(DBGBCR##n##_EL1, *val);                                                    \
+                break;                                                                             \
+            case 6:                                                                                \
+                if (is_read)                                                                       \
+                    *val = mrs(DBGWVR##n##_EL1);                                                   \
+                else                                                                               \
+                    msr(DBGWVR##n##_EL1, *val);                                                    \
+                break;                                                                             \
+            case 7:                                                                                \
+                if (is_read)                                                                       \
+                    *val = mrs(DBGWCR##n##_EL1);                                                   \
+                else                                                                               \
+                    msr(DBGWCR##n##_EL1, *val);                                                    \
+                break;                                                                             \
+        }                                                                                          \
+        break;
+
+static void hv_dbg_access(u64 n, u64 op2, bool is_read, u64 *val)
+{
+    switch (n) {
+        DBG_CASE(0)
+        DBG_CASE(1)
+        DBG_CASE(2)
+        DBG_CASE(3)
+        DBG_CASE(4)
+        DBG_CASE(5)
+        DBG_CASE(6)
+        DBG_CASE(7)
+        DBG_CASE(8)
+        DBG_CASE(9)
+        DBG_CASE(10)
+        DBG_CASE(11)
+        DBG_CASE(12)
+        DBG_CASE(13)
+        DBG_CASE(14)
+        DBG_CASE(15)
+    }
+}
+
 static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 {
     u64 reg = iss & (ESR_ISS_MSR_OP0 | ESR_ISS_MSR_OP2 | ESR_ISS_MSR_OP1 | ESR_ISS_MSR_CRn |
@@ -228,16 +338,29 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         hv_sprr_traps_tlbi())
         return false;
 
+    /*
+     * DBGB{V,C}Rn_EL1 / DBGW{V,C}Rn_EL1 (op0=2, op1=0, CRn=0, op2=4..7): pass through here instead
+     * of a proxy round trip per register on every CPU (the HV doesn't use HW breakpoints).
+     */
+    if (FIELD_GET(ESR_ISS_MSR_OP0, reg) == 2 && FIELD_GET(ESR_ISS_MSR_OP1, reg) == 0 &&
+        FIELD_GET(ESR_ISS_MSR_CRn, reg) == 0 && FIELD_GET(ESR_ISS_MSR_OP2, reg) >= 4) {
+        u64 n = FIELD_GET(ESR_ISS_MSR_CRm, reg), op2 = FIELD_GET(ESR_ISS_MSR_OP2, reg);
+        if (n < hv_dbg_nbrps(op2)) {
+            hv_dbg_access(n, op2, is_read, &regs[rt]);
+            return true;
+        }
+    }
+
     switch (reg) {
         SYSREG_PASS(SYS_TPIDR2_EL0);
         SYSREG_PASS(SYS_IMP_APL_TPIDR_GL2);
         SYSREG_PASS(SYS_IMP_APL_CORE_NRG_ACC_DAT);
         SYSREG_PASS(SYS_IMP_APL_CORE_SRM_NRG_ACC_DAT);
         /* Architectural timer, for ECV */
-        SYSREG_MAP(SYS_CNTV_CTL_EL0, SYS_CNTV_CTL_EL02)
+        SYSREG_TMR_CTL(SYS_CNTV_CTL_EL0, SYS_CNTV_CTL_EL02, VM_TMR_FIQ_ENA_ENA_V)
         SYSREG_MAP(SYS_CNTV_CVAL_EL0, SYS_CNTV_CVAL_EL02)
         SYSREG_MAP(SYS_CNTV_TVAL_EL0, SYS_CNTV_TVAL_EL02)
-        SYSREG_MAP(SYS_CNTP_CTL_EL0, SYS_CNTP_CTL_EL02)
+        SYSREG_TMR_CTL(SYS_CNTP_CTL_EL0, SYS_CNTP_CTL_EL02, VM_TMR_FIQ_ENA_ENA_P)
         SYSREG_MAP(SYS_CNTP_CVAL_EL0, SYS_CNTP_CVAL_EL02)
         SYSREG_MAP(SYS_CNTP_TVAL_EL0, SYS_CNTP_TVAL_EL02)
         /* Spammy stuff seen on t600x p-cores */
@@ -493,8 +616,12 @@ static void hv_exc_entry(void)
 
 static void hv_exc_exit(struct exc_info *ctx)
 {
+    static int dbg_exit; // XXX M5 debug
+    bool dbg = dbg_exit++ < 3;
     hv_wdt_breadcrumb('x');
+    if (dbg) { printf("HVDBG: exit: update_fiq\n"); iodev_console_flush(); }
     hv_update_fiq();
+    if (dbg) { printf("HVDBG: exit: sprr/pmcr/cntvoff\n"); iodev_console_flush(); }
     hv_sprr_timer_arm();
     /* reenable PMU counters */
     reg_set(SYS_IMP_APL_PMCR0, PERCPU(exc_entry_pmcr0_cnt));
@@ -507,6 +634,7 @@ static void hv_exc_exit(struct exc_info *ctx)
     hv_set_elr(ctx->elr);
     msr(SP_EL0, ctx->sp[0]);
     msr(SP_EL1, ctx->sp[1]);
+    if (dbg) { printf("HVDBG: exit: done spsr=0x%lx elr=0x%lx\n", ctx->spsr, ctx->elr); iodev_console_flush(); }
 }
 
 static void hv_dump_serror(struct exc_info *ctx)
@@ -568,6 +696,20 @@ bool hv_exc_sync(struct exc_info *ctx)
                     handled = hv_handle_msr_unlocked(ctx, ctx->afsr1);
                     break;
             }
+            break;
+        case ESR_EC_WFI:
+            /*
+             * Only trapped on T8142 secondaries (HCR_EL2.TWI): their WFI mode doesn't retain
+             * state and CYC_OVRD isn't writable, so the guest idles by spinning instead.
+             */
+            {
+                static int dbg_wfi; // XXX M5 debug
+                if (dbg_wfi++ < 4) {
+                    printf("HVDBG: cpu%d guest WFI elr=0x%lx\n", smp_id(), ctx->elr);
+                    iodev_console_flush();
+                }
+            }
+            handled = true;
             break;
         case ESR_EC_HVC:
             hv_wdt_breadcrumb('h');
@@ -674,15 +816,20 @@ void hv_exc_irq(struct exc_info *ctx)
 void hv_exc_fiq(struct exc_info *ctx)
 {
     bool tick = false;
+    static int dbg_fiq; // XXX M5 debug
+    bool dbg = dbg_fiq++ < 3;
 
     hv_maybe_exit();
+    if (dbg) { printf("HVDBG: fiq 1 (line 4)\n"); iodev_console_flush(); }
 
     if (mrs(CNTP_CTL_EL0) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
         msr(CNTP_CTL_EL0, CNTx_CTL_ISTATUS | CNTx_CTL_IMASK | CNTx_CTL_ENABLE);
         tick = true;
     }
+    if (dbg) { printf("HVDBG: fiq 2 (line 9)\n"); iodev_console_flush(); }
 
     int interruptible_cpu = hv_pinned_cpu;
+    if (dbg) { printf("HVDBG: fiq 3 (line 11)\n"); iodev_console_flush(); }
     if (interruptible_cpu == -1)
         interruptible_cpu = boot_cpu_idx;
 
@@ -692,11 +839,15 @@ void hv_exc_fiq(struct exc_info *ctx)
         hv_arm_tick(true);
         return;
     }
+    if (dbg) { printf("HVDBG: fiq 4 (line 20)\n"); iodev_console_flush(); }
 
     // Slow (single threaded) path
     hv_wdt_breadcrumb('F');
+    if (dbg) { printf("HVDBG: fiq 5 (line 23)\n"); iodev_console_flush(); }
     hv_get_context(ctx);
+    if (dbg) { printf("HVDBG: fiq 6 (line 24)\n"); iodev_console_flush(); }
     hv_exc_entry();
+    if (dbg) { printf("HVDBG: fiq 7 (line 25)\n"); iodev_console_flush(); }
 
     // Only poll for HV events in the interruptible CPU
     if (tick) {
@@ -707,13 +858,16 @@ void hv_exc_fiq(struct exc_info *ctx)
             hv_arm_tick(true);
         }
     }
+    if (dbg) { printf("HVDBG: fiq 8 (line 35)\n"); iodev_console_flush(); }
 
     if (mrs(CNTV_CTL_EL0) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
         msr(CNTV_CTL_EL0, CNTx_CTL_ISTATUS | CNTx_CTL_IMASK | CNTx_CTL_ENABLE);
         hv_exc_proxy(ctx, START_HV, HV_VTIMER, NULL);
     }
+    if (dbg) { printf("HVDBG: fiq 9 (line 40)\n"); iodev_console_flush(); }
 
     u64 reg = mrs(SYS_IMP_APL_PMCR0);
+    if (dbg) { printf("HVDBG: fiq 10 (line 42)\n"); iodev_console_flush(); }
     if ((reg & (PMCR0_IMODE_MASK | PMCR0_IACT)) == (PMCR0_IMODE_FIQ | PMCR0_IACT)) {
 #ifdef DEBUG_PMU_IRQ
         printf("[FIQ] PMC IRQ, masking and delivering to the guest\n");
@@ -721,14 +875,17 @@ void hv_exc_fiq(struct exc_info *ctx)
         reg_clr(SYS_IMP_APL_PMCR0, PMCR0_IACT | PMCR0_IMODE_MASK);
         PERCPU(pmc_pending) = true;
     }
+    if (dbg) { printf("HVDBG: fiq 11 (line 49)\n"); iodev_console_flush(); }
 
     reg = mrs(SYS_IMP_APL_UPMCR0);
+    if (dbg) { printf("HVDBG: fiq 12 (line 51)\n"); iodev_console_flush(); }
     if (FIELD_GET(UPMCR0_IMODE_T8020, reg) == UPMCR0_IMODE_FIQ &&
         (mrs(SYS_IMP_APL_UPMSR) & UPMSR_IACT)) {
         printf("[FIQ] UPMC IRQ, masking");
         reg_clr(SYS_IMP_APL_UPMCR0, UPMCR0_IMODE_T8020);
         hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_FIQ, NULL);
     }
+    if (dbg) { printf("HVDBG: fiq 13 (line 57)\n"); iodev_console_flush(); }
 
     if (mrs(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING) {
         if (PERCPU(ipi_queued)) {
@@ -738,12 +895,16 @@ void hv_exc_fiq(struct exc_info *ctx)
         msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
         sysop("isb");
     }
+    if (dbg) { printf("HVDBG: fiq 14 (line 66)\n"); iodev_console_flush(); }
 
     hv_maybe_switch_cpu(ctx, START_HV, HV_CPU_SWITCH, NULL);
+    if (dbg) { printf("HVDBG: fiq 15 (line 68)\n"); iodev_console_flush(); }
 
     // Handles guest timers
     hv_exc_exit(ctx);
+    if (dbg) { printf("HVDBG: fiq 16 (line 71)\n"); iodev_console_flush(); }
     hv_wdt_breadcrumb('f');
+    if (dbg) { printf("HVDBG: fiq 17 (line 72)\n"); iodev_console_flush(); }
 }
 
 void hv_exc_serr(struct exc_info *ctx)

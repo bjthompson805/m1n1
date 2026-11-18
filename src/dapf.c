@@ -181,6 +181,13 @@ int dapf_init_all(void)
     int count = 0;
     struct entry *entry = dapf_entries;
 
+    // XXX M5: dart-* reg[1] is a shared PMGR-area range (0x380714000), not a DAPF;
+    // writing it raises an SError. Skip until the real M5 DAPF layout is known.
+    if (chip_id == T8142) {
+        printf("dapf: skipping on T8142 (layout unknown)\n");
+        return 0;
+    }
+
     while (entry->path != NULL) {
         if (adt_path_offset(adt, entry->path) < 0) {
             entry++;

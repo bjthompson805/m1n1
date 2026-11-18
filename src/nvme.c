@@ -135,6 +135,10 @@ static rtkit_dev_t *nvme_rtkit = NULL;
 static sart_dev_t *nvme_sart = NULL;
 
 static u64 nvme_base;
+// NVMMU and linear SQ registers: nvme_base, except on M5 (T8142) where reg[9] ends at 0x10000
+// and they live in the reg[3] block, with the linear SQ already enabled by the firmware.
+static u64 nvmmu_base;
+static bool lsq_in_nvmmu;
 
 static struct nvme_queue adminq, ioq;
 
@@ -244,9 +248,9 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
 
     nvme_poll_syslog();
     if (q->adminq)
-        write32(nvme_base + NVME_DB_LINEAR_ASQ, tag);
+        write32(nvmmu_base + NVME_DB_LINEAR_ASQ, tag);
     else
-        write32(nvme_base + NVME_DB_LINEAR_IOSQ, tag);
+        write32(nvmmu_base + NVME_DB_LINEAR_IOSQ, tag);
     nvme_poll_syslog();
 
     timeout = timeout_calculate(NVME_TIMEOUT);
@@ -268,8 +272,8 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
             printf("nvme: invalid tag in CQ: expected %d but got %d\n", tag, cqe.tag);
         }
 
-        write32(nvme_base + NVMMU_TCB_INVAL, cqe.tag);
-        if (read32(nvme_base + NVMMU_TCB_STAT))
+        write32(nvmmu_base + NVMMU_TCB_INVAL, cqe.tag);
+        if (read32(nvmmu_base + NVMMU_TCB_STAT))
             printf("nvme: NVMMU invalidation for tag %d failed\n", cqe.tag);
 
         /* increment head and switch phase once the end of the queue has been reached */
@@ -325,9 +329,20 @@ bool nvme_init(void)
         nvme_type = NVME_T8103;
 
     int nvme_reg = nvme_type == NVME_T8132 ? 9 : 3;
-    if (adt_get_reg(adt, adt_path, "reg", nvme_reg, &nvme_base, NULL) < 0) {
+    u64 nvme_size;
+    if (adt_get_reg(adt, adt_path, "reg", nvme_reg, &nvme_base, &nvme_size) < 0) {
         printf("nvme: Error getting NVMe base address.\n");
         return NULL;
+    }
+    nvmmu_base = nvme_base;
+    lsq_in_nvmmu = false;
+    if (nvme_type == NVME_T8132 && nvme_size < NVMMU_TCB_STAT) {
+        if (adt_get_reg(adt, adt_path, "reg", 3, &nvmmu_base, NULL) < 0) {
+            printf("nvme: Error getting NVMMU base address.\n");
+            return NULL;
+        }
+        lsq_in_nvmmu = true;
+        printf("nvme: NVMMU at 0x%lx\n", nvmmu_base);
     }
 
     u32 cg;
@@ -372,12 +387,13 @@ bool nvme_init(void)
     }
 
     /* setup controller and NVMMU for linear submission queue */
-    set32(nvme_base + NVME_LINEAR_SQ_CTRL, NVME_LINEAR_SQ_CTRL_EN);
+    if (!lsq_in_nvmmu)
+        set32(nvme_base + NVME_LINEAR_SQ_CTRL, NVME_LINEAR_SQ_CTRL_EN);
     write32(nvme_base + NVME_MAX_PEND_CMDS_CTRL,
             ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
-    write32(nvme_base + NVMMU_NUM, NVME_QUEUE_SIZE - 1);
-    write64_lo_hi(nvme_base + NVMMU_ASQ_BASE, (u64)adminq.tcbs);
-    write64_lo_hi(nvme_base + NVMMU_IOSQ_BASE, (u64)ioq.tcbs);
+    write32(nvmmu_base + NVMMU_NUM, NVME_QUEUE_SIZE - 1);
+    write64_lo_hi(nvmmu_base + NVMMU_ASQ_BASE, (u64)adminq.tcbs);
+    write64_lo_hi(nvmmu_base + NVMMU_IOSQ_BASE, (u64)ioq.tcbs);
 
     /* setup admin queue */
     if (!nvme_ctrl_disable()) {

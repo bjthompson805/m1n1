@@ -651,6 +651,11 @@ void mmu_init_secondary(int cpu)
     smp_wait(cpu);
 }
 
+bool mmu_init_secondary_timeout(int cpu, u64 timeout_us)
+{
+    return smp_call4_timeout(cpu, mmu_secondary_setup, 0, 0, 0, 0, timeout_us, NULL);
+}
+
 void mmu_shutdown(void)
 {
     fb_console_reserve_lines(3);

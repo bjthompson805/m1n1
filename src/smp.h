@@ -22,9 +22,14 @@ void smp_stop_secondaries(bool deep_sleep);
 #define smp_call2(i, f, a, b)    smp_call4(i, f, a, b, 0, 0)
 #define smp_call3(i, f, a, b, c) smp_call4(i, f, a, b, c, 0)
 
+void smp_dump_cpu(int cpu);
+bool smp_take_call4_timeout(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                            u64 timeout_us);
 void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 
 u64 smp_wait(int cpu);
+bool smp_call4_timeout(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 timeout_us,
+                       u64 *ret);
 
 bool smp_is_alive(int cpu);
 uint64_t smp_get_mpidr(int cpu);

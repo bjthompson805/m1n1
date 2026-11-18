@@ -513,6 +513,7 @@ struct midr_part_features {
     bool amx;
     bool actlr_el2;
     bool counter_redirect;
+    bool vm_tmr_fiq_ena_ro; // VM_TMR_FIQ_ENA_EL2 writes fault (M5)
 };
 
 extern bool is_mac;

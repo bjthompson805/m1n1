@@ -1810,9 +1810,14 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
 }
 
 static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_alt,
-                                   const char *fdt_path, bool remap, u64 base, u64 skip)
+                                   const char *fdt_path_in, bool remap, u64 base, u64 skip)
 {
     int ret = 0;
+
+    // fdt_path may point into the FDT (alias value), which moves when reserved-memory grows
+    char fdt_path[256];
+    strncpy(fdt_path, fdt_path_in, sizeof(fdt_path) - 1);
+    fdt_path[sizeof(fdt_path) - 1] = '\0';
 
     int fdt_node = fdt_path_offset(dt, fdt_path);
     if (fdt_node < 0) {
@@ -2320,11 +2325,16 @@ static int dt_set_pmp(void)
 
 static int dt_set_sep(void)
 {
-    const char *path = fdt_get_alias(dt, "sep");
-    if (path == NULL) {
+    const char *alias_path = fdt_get_alias(dt, "sep");
+    if (alias_path == NULL) {
         printf("FDT: sep alias not found in devtree\n");
         return 0;
     }
+
+    // copy: the alias value moves when reserved-memory grows
+    char path[256];
+    strncpy(path, alias_path, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
 
     int anode_mmap = adt_path_offset(adt, "/chosen/memory-map");
     if (anode_mmap < 0)

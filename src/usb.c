@@ -6,6 +6,7 @@
 #include "i2c.h"
 #include "iodev.h"
 #include "malloc.h"
+#include "memory.h"
 #include "pmgr.h"
 #include "string.h"
 #include "tps6598x.h"
@@ -192,40 +193,59 @@ dwc3_dev_t *usb_iodev_bringup(u32 idx)
     return usb_dwc3_init(usb_reg.drd_regs, usb_dart);
 }
 
+/*
+ * Both CDC-ACM pipes (the proxy/console iodev and the HV vUART iodev) drive the same DWC3
+ * controller, but each iodev has its own lock. Serialize all controller access here, or two
+ * CPUs (e.g. a secondary emulating the vUART while the boot CPU talks to the proxy) can run its
+ * event handling concurrently. The lock is recursive per CPU.
+ */
+static DECLARE_SPINLOCK(usb_dwc3_lock);
+
+#define USB_LOCKED(expr)                                                                           \
+    ({                                                                                             \
+        bool _locked = mmu_active();                                                               \
+        if (_locked)                                                                               \
+            spin_lock(&usb_dwc3_lock);                                                             \
+        __auto_type _ret = (expr);                                                                 \
+        if (_locked)                                                                               \
+            spin_unlock(&usb_dwc3_lock);                                                           \
+        _ret;                                                                                      \
+    })
+
 #define USB_IODEV_WRAPPER(name, pipe)                                                              \
     static ssize_t usb_##name##_can_read(void *dev)                                                \
     {                                                                                              \
-        return usb_dwc3_can_read(dev, pipe);                                                       \
+        return USB_LOCKED(usb_dwc3_can_read(dev, pipe));                                           \
     }                                                                                              \
                                                                                                    \
     static bool usb_##name##_can_write(void *dev)                                                  \
     {                                                                                              \
-        return usb_dwc3_can_write(dev, pipe);                                                      \
+        return USB_LOCKED(usb_dwc3_can_write(dev, pipe));                                          \
     }                                                                                              \
                                                                                                    \
     static ssize_t usb_##name##_read(void *dev, void *buf, size_t count)                           \
     {                                                                                              \
-        return usb_dwc3_read(dev, pipe, buf, count);                                               \
+        return USB_LOCKED(usb_dwc3_read(dev, pipe, buf, count));                                   \
     }                                                                                              \
                                                                                                    \
     static ssize_t usb_##name##_write(void *dev, const void *buf, size_t count)                    \
     {                                                                                              \
-        return usb_dwc3_write(dev, pipe, buf, count);                                              \
+        return USB_LOCKED(usb_dwc3_write(dev, pipe, buf, count));                                  \
     }                                                                                              \
                                                                                                    \
     static ssize_t usb_##name##_queue(void *dev, const void *buf, size_t count)                    \
     {                                                                                              \
-        return usb_dwc3_queue(dev, pipe, buf, count);                                              \
+        return USB_LOCKED(usb_dwc3_queue(dev, pipe, buf, count));                                  \
     }                                                                                              \
                                                                                                    \
     static void usb_##name##_handle_events(void *dev)                                              \
     {                                                                                              \
-        usb_dwc3_handle_events(dev);                                                               \
+        USB_LOCKED((usb_dwc3_handle_events(dev), 0));                                              \
     }                                                                                              \
                                                                                                    \
     static void usb_##name##_flush(void *dev)                                                      \
     {                                                                                              \
-        usb_dwc3_flush(dev, pipe);                                                                 \
+        USB_LOCKED((usb_dwc3_flush(dev, pipe), 0));                                                \
     }
 
 USB_IODEV_WRAPPER(0, CDC_ACM_PIPE_0)

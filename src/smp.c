@@ -51,6 +51,9 @@ static bool wfe_mode SMP_SHARED = false;
 static int target_cpu SMP_SHARED;
 static int cpu_nodes[MAX_CPUS];
 static struct spin_table spin_table[MAX_CPUS] SMP_SHARED;
+/* XXX M5 debug: secondary spin-loop wakeups and DAIF, to tell a dead CPU from a deaf one */
+volatile u64 smp_spin_count[MAX_CPUS] SMP_SHARED;
+volatile u64 smp_spin_daif[MAX_CPUS] SMP_SHARED;
 
 struct cpu_info {
     bool valid;
@@ -117,6 +120,8 @@ void smp_secondary_entry(void)
 
     while (1) {
         while (!(target = me->target)) {
+            smp_spin_count[index]++;
+            smp_spin_daif[index] = mrs(DAIF);
             if (wfe_mode) {
                 sysop("wfe");
             } else {
@@ -149,6 +154,36 @@ void smp_secondary_prep_el3(void)
     return;
 }
 
+static u32 cpu_start_bit(int index, const struct cpu_info *cpu)
+{
+    /* T8142 has six E cores followed by four P cores, not four-core banks */
+    if (chip_id == T8142)
+        return BIT(index);
+    return BIT(4 * cpu->cluster + cpu->core);
+}
+
+/*
+ * On T8142 iBoot locks RVBAR to the image base, which holds the header, not the reset vector.
+ * Plant a branch to _vectors_start there (the header word is unused once we're running).
+ */
+static bool smp_patch_locked_rvbar(u64 rvbar)
+{
+    u64 vector = rvbar & RVBAR_ADDR;
+
+    if (vector == (u64)_vectors_start)
+        return true;
+    if (vector < (u64)_base || vector >= (u64)_vectors_start || (vector & 0x3fff))
+        return false;
+
+    write32(vector, 0x14000000 | ((((u64)_vectors_start - vector) >> 2) & 0x3ffffff));
+    dc_cvau_range((void *)vector, 4);
+    sysop("dsb ish");
+    ic_ivau_range((void *)vector, 4);
+    sysop("dsb ish");
+    sysop("isb");
+    return true;
+}
+
 static void smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
@@ -162,7 +197,12 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
     if (spin_table[index].flag)
         return;
 
-    if (!cpu_features->apple_sysregs_unlocked &&
+    if (!cpu_features->apple_sysregs_unlocked && chip_id == T8142 &&
+        !smp_patch_locked_rvbar(read64(cpu->impl_reg))) {
+        printf("Failed! \n    RVBAR (=0x%lx) is locked and not patchable\n",
+               read64(cpu->impl_reg) & RVBAR_ADDR);
+        return;
+    } else if (!cpu_features->apple_sysregs_unlocked && chip_id != T8142 &&
         (read64(cpu->impl_reg) & RVBAR_ADDR) != (u64)_vectors_start) {
         printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
                read64(cpu->impl_reg) & RVBAR_ADDR, (u64)_vectors_start);
@@ -190,7 +230,7 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
-    write32(start_base + 0x4, 1 << (4 * cpu->cluster + cpu->core));
+    write32(start_base + 0x4, cpu_start_bit(index, cpu));
 
     // Actually start the core
     write32(start_base + 0x8 + 4 * cpu->cluster, 1 << cpu->core);
@@ -226,7 +266,7 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
     u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
 
     // Request CPU stop
-    write32(start_base + 0x0, 1 << (4 * cpu->cluster + cpu->core));
+    write32(start_base + 0x0, cpu_start_bit(index, cpu));
 
     u64 dsleep = deep_sleep;
     // Put the CPU to sleep
@@ -319,6 +359,12 @@ int smp_init(void)
         case T8142:
         case T8152:
             cpu_start_off = CPU_START_OFF_T8112;
+            /*
+             * Secondaries cold-start in a WFI mode that doesn't retain state, and CYC_OVRD
+             * isn't ours to change, so park them with WFE instead of deep WFI + IPI.
+             */
+            if (chip_id == T8142)
+                wfe_mode = true;
             break;
         case T6020:
         case T6021:
@@ -516,6 +562,90 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
         sysop("dmb sy");
 }
 
+/* XXX M5 debug: report a CPU that doesn't take a call */
+void smp_dump_cpu(int cpu)
+{
+    struct spin_table *t = &spin_table[cpu];
+
+    for (int i = 0; i < 2; i++) {
+        printf("SMP: cpu%d flag=%ld target=0x%lx mpidr=0x%lx spins=%ld daif=0x%lx\n", cpu, t->flag,
+               t->target, t->mpidr, smp_spin_count[cpu], smp_spin_daif[cpu]);
+        udelay(100000);
+    }
+}
+
+/* smp_call4 that gives up if the CPU doesn't take the call in time (the call is withdrawn) */
+bool smp_take_call4_timeout(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                            u64 timeout_us)
+{
+    if (cpu >= MAX_CPUS || cpu == boot_cpu_idx)
+        return false;
+
+    struct spin_table *target = &spin_table[cpu];
+    u64 flag = target->flag;
+    target->args[0] = arg0;
+    target->args[1] = arg1;
+    target->args[2] = arg2;
+    target->args[3] = arg3;
+    sysop("dmb sy");
+    target->target = (u64)func;
+    sysop("dsb sy");
+
+    if (wfe_mode)
+        sysop("sev");
+    else
+        smp_send_ipi(cpu);
+
+    u64 deadline = get_ticks() + timeout_us * (mrs(CNTFRQ_EL0) / 1000000);
+    while (target->flag == flag) {
+        sysop("dmb sy");
+        if (get_ticks() > deadline) {
+            printf("SMP: CPU %d didn't take call %p\n", cpu, func);
+            smp_dump_cpu(cpu);
+            target->target = 0;
+            sysop("dsb sy");
+            return false;
+        }
+    }
+    return true;
+}
+
+/* smp_call4 + smp_wait with a deadline; false if the CPU didn't take or finish the call */
+bool smp_call4_timeout(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 timeout_us,
+                       u64 *ret)
+{
+    if (cpu >= MAX_CPUS || cpu == boot_cpu_idx)
+        return false;
+
+    struct spin_table *target = &spin_table[cpu];
+    u64 flag = target->flag;
+    target->args[0] = arg0;
+    target->args[1] = arg1;
+    target->args[2] = arg2;
+    target->args[3] = arg3;
+    sysop("dmb sy");
+    target->target = (u64)func;
+    sysop("dsb sy");
+
+    if (wfe_mode)
+        sysop("sev");
+    else
+        smp_send_ipi(cpu);
+
+    u64 deadline = get_ticks() + timeout_us * (mrs(CNTFRQ_EL0) / 1000000);
+    while (target->target) {
+        sysop("dmb sy");
+        if (get_ticks() > deadline) {
+            printf("SMP: CPU %d call %p timed out (flag %ld -> %ld)\n", cpu, func, flag,
+                   target->flag);
+            return false;
+        }
+    }
+    if (ret)
+        *ret = target->retval;
+    return true;
+}
+
 u64 smp_wait(int cpu)
 {
     if (cpu >= MAX_CPUS)
@@ -533,6 +663,14 @@ void smp_set_wfe_mode(bool new_mode)
 {
     wfe_mode = new_mode;
     sysop("dsb sy");
+
+    /* T8142 secondaries always sit in the WFE/SEV loop; an IPI there would never be acked */
+    if (chip_id == T8142) {
+        wfe_mode = true;
+        sysop("dsb sy");
+        sysop("sev");
+        return;
+    }
 
     for (int cpu = 0; cpu < MAX_CPUS; cpu++)
         if (cpu != boot_cpu_idx && smp_is_alive(cpu))
