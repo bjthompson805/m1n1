@@ -265,7 +265,8 @@ static struct state controllers[NUM_CONTROLLERS];
  * node, all the way to L0, since the OS side (FreeBSD) only knows a generic ECAM host.
  *
  * ADT reg: 0 ECAM, 1 RC, 2 PHY (tunables; common at +0x4000, per-port lane PHYs inside),
- * 3 PHY control, 4 PHY IP, 5 AXI2AF, 6-7 unknown, then 6 per port: 0 config, 2 lane PHY.
+ * 3 PHY control, 4 PHY IP, 5 AXI2AF, 6-7 unknown, then 6 per port: 0 config, 2 lane PHY,
+ * 3 Intr2AXI.
  */
 #define T8142_SHARED_REGS    8
 #define T8142_PORT_REGS      6
@@ -276,6 +277,7 @@ static struct state controllers[NUM_CONTROLLERS];
 #define T8142_REG_AXI        5
 #define T8142_PHYCMN_OFFSET  0x4000
 #define T8142_PORT_LTSSM_EN  0x080
+#define T8142_INTR2AXI_CTRL  0x080
 #define T8142_PORT_TUNE_130  0x03020000
 #define T8142_RC_LTSSM       0x728 /* DWC PL debug 0: LTSSM state in [5:0] */
 #define T8142_LTSSM_L0       0x11
@@ -286,7 +288,7 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
 {
     char bridge[64];
     int bridge_offset;
-    u64 port_base, lane, gpio_base, pad = 0;
+    u64 port_base, lane, intr2axi, gpio_base, pad = 0;
     u32 len, v;
 
     snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", path, port);
@@ -297,6 +299,8 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
     if (adt_get_reg(adt, adt_path, "reg", T8142_SHARED_REGS + T8142_PORT_REGS * port, &port_base,
                     NULL) ||
         adt_get_reg(adt, adt_path, "reg", T8142_SHARED_REGS + T8142_PORT_REGS * port + 2, &lane,
+                    NULL) ||
+        adt_get_reg(adt, adt_path, "reg", T8142_SHARED_REGS + T8142_PORT_REGS * port + 3, &intr2axi,
                     NULL)) {
         printf("pcie: t8142: port %d regs missing\n", port);
         return -1;
@@ -419,8 +423,17 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
         mask16(config_base + PCIE_CAP_BASE + PCIE_LNKCTL2, PCIE_LNKCTL2_TLS,
                FIELD_PREP(PCIE_LNKCTL2_TLS, max_speed));
     }
+    /* One lane, as the kext and Linux's T6050 port configure set it */
+    mask32(config_base + DWC_DBI_PORT_LINK_CONTROL, DWC_DBI_PORT_LINK_MODE,
+           FIELD_PREP(DWC_DBI_PORT_LINK_MODE, DWC_DBI_PORT_LINK_MODE_1_LANE));
+    mask32(config_base + DWC_DBI_LINK_WIDTH_SPEED_CONTROL, DWC_DBI_LINK_WIDTH,
+           FIELD_PREP(DWC_DBI_LINK_WIDTH, 1));
+    mask32(config_base + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_MLW,
+           FIELD_PREP(PCIE_LNKCAP_MLW, 1));
     clear32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
 
+    /* _writeIntr2AxiReg(0x80, 1) before link training (kext; Linux T6050 likewise) */
+    write32(intr2axi + T8142_INTR2AXI_CTRL, 1);
     set32(lane + APCIE_PHY_CTRL, BIT(31));
     set32(port_base + T8142_PORT_LTSSM_EN, 1);
     for (v = 0; v < 2000; v++) {
