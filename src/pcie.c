@@ -302,22 +302,8 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
         return -1;
     }
 
-    /* Endpoint power (N1 reg_on): function-reset = pKW4('gPxx', 0x800000), level in [15:0]. */
-    const u32 *f = adt_getprop(adt, bridge_offset, "function-reset", &len);
-    if (f && len >= 16 && (!memcmp(&f[1], "4WKp", 4) || !memcmp(&f[1], "pKW4", 4))) {
-        smc_dev_t *smc = smc_init();
-        if (!smc || smc_write_u32(smc, f[2], f[3] | 1)) {
-            printf("pcie: t8142: port %d endpoint power-on failed\n", port);
-            if (smc)
-                smc_shutdown(smc);
-            return -1;
-        }
-        smc_shutdown(smc);
-        mdelay(50);
-    }
-
-    /* PERST#: function-perst = GPIO(pin, flags) on gpio0. */
-    f = adt_getprop(adt, bridge_offset, "function-perst", &len);
+    /* PERST#: function-perst = GPIO(pin, flags) on gpio0; held from here. */
+    const u32 *f = adt_getprop(adt, bridge_offset, "function-perst", &len);
     if (f && len >= 16) {
         int gpio_path[8];
         if (adt_path_offset_trace(adt, "/arm-io/gpio0", gpio_path) < 0 ||
@@ -327,6 +313,28 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
         }
         pad = gpio_base + 4 * f[2];
         mask32(pad, 0xf, T8142_GPIO_OUT_LOW);
+    }
+
+    /*
+     * Endpoint power (N1 reg_on): function-reset = pKW4('gPxx', 0x800000), level in [15:0].
+     * A SoC reset does not reset the N1: power-cycle it (off 250 ms, on, 150 ms) so it comes
+     * back in its ROM personality.
+     */
+    f = adt_getprop(adt, bridge_offset, "function-reset", &len);
+    if (f && len >= 16 && (!memcmp(&f[1], "4WKp", 4) || !memcmp(&f[1], "pKW4", 4))) {
+        smc_dev_t *smc = smc_init();
+        int err = !smc || smc_write_u32(smc, f[2], f[3]);
+        if (!err) {
+            mdelay(250);
+            err = smc_write_u32(smc, f[2], f[3] | 1);
+        }
+        if (smc)
+            smc_shutdown(smc);
+        if (err) {
+            printf("pcie: t8142: port %d endpoint power cycle failed\n", port);
+            return -1;
+        }
+        mdelay(150);
     }
 
     write32(port_base + 0x88, 0x110);
