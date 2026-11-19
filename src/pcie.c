@@ -3,6 +3,7 @@
 #include "adt.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "smc.h"
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
@@ -258,6 +259,246 @@ struct state {
 
 static struct state controllers[NUM_CONTROLLERS];
 
+/*
+ * T8142 (M5) internal APCIe: iBoot leaves the shared PHY in reset, the ports in their reset
+ * configuration and PERST# asserted. Bring the controller up and train every port with a bridge
+ * node, all the way to L0, since the OS side (FreeBSD) only knows a generic ECAM host.
+ *
+ * ADT reg: 0 ECAM, 1 RC, 2 PHY (tunables; common at +0x4000, per-port lane PHYs inside),
+ * 3 PHY control, 4 PHY IP, 5 AXI2AF, 6-7 unknown, then 6 per port: 0 config, 2 lane PHY.
+ */
+#define T8142_SHARED_REGS    8
+#define T8142_PORT_REGS      6
+#define T8142_REG_RC         1
+#define T8142_REG_PHY        2
+#define T8142_REG_PHYCTL     3
+#define T8142_REG_PHYIP      4
+#define T8142_REG_AXI        5
+#define T8142_PHYCMN_OFFSET  0x4000
+#define T8142_PORT_LTSSM_EN  0x080
+#define T8142_PORT_TUNE_130  0x03020000
+#define T8142_RC_LTSSM       0x728 /* DWC PL debug 0: LTSSM state in [5:0] */
+#define T8142_LTSSM_L0       0x11
+#define T8142_GPIO_OUT_LOW   0x2
+#define T8142_GPIO_OUT_HIGH  0x3
+
+static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config_base)
+{
+    char bridge[64];
+    int bridge_offset;
+    u64 port_base, lane, gpio_base, pad = 0;
+    u32 len, v;
+
+    snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", path, port);
+    if ((bridge_offset = adt_path_offset(adt, bridge)) < 0)
+        return 0;
+
+    printf("pcie: t8142: initializing port %d\n", port);
+    if (adt_get_reg(adt, adt_path, "reg", T8142_SHARED_REGS + T8142_PORT_REGS * port, &port_base,
+                    NULL) ||
+        adt_get_reg(adt, adt_path, "reg", T8142_SHARED_REGS + T8142_PORT_REGS * port + 2, &lane,
+                    NULL)) {
+        printf("pcie: t8142: port %d regs missing\n", port);
+        return -1;
+    }
+
+    /* Endpoint power (N1 reg_on): function-reset = pKW4('gPxx', 0x800000), level in [15:0]. */
+    const u32 *f = adt_getprop(adt, bridge_offset, "function-reset", &len);
+    if (f && len >= 16 && (!memcmp(&f[1], "4WKp", 4) || !memcmp(&f[1], "pKW4", 4))) {
+        smc_dev_t *smc = smc_init();
+        if (!smc || smc_write_u32(smc, f[2], f[3] | 1)) {
+            printf("pcie: t8142: port %d endpoint power-on failed\n", port);
+            if (smc)
+                smc_shutdown(smc);
+            return -1;
+        }
+        smc_shutdown(smc);
+        mdelay(50);
+    }
+
+    /* PERST#: function-perst = GPIO(pin, flags) on gpio0. */
+    f = adt_getprop(adt, bridge_offset, "function-perst", &len);
+    if (f && len >= 16) {
+        int gpio_path[8];
+        if (adt_path_offset_trace(adt, "/arm-io/gpio0", gpio_path) < 0 ||
+            adt_get_reg(adt, gpio_path, "reg", 0, &gpio_base, NULL)) {
+            printf("pcie: t8142: no gpio0\n");
+            return -1;
+        }
+        pad = gpio_base + 4 * f[2];
+        mask32(pad, 0xf, T8142_GPIO_OUT_LOW);
+    }
+
+    write32(port_base + 0x88, 0x110);
+    write32(port_base + 0x100, 0xffffffff);
+    write32(port_base + 0x148, 0xffffffff);
+    write32(port_base + 0x210, 0xffffffff);
+    write32(port_base + 0x80, 0x0);
+    write32(port_base + 0x84, 0x0);
+    write32(port_base + 0x104, 0xfffffff0);
+    write32(port_base + 0x124, 0x100);
+    write32(port_base + 0x16c, 0x0);
+    write32(port_base + 0x13c, 0x0);
+    write32(port_base + 0x800, 0x100100);
+    write32(port_base + 0x808, 0x1001ff);
+    write32(port_base + APCIE_T602X_PORT_RESET, 0x10000);
+    for (int i = 0; i < 16; i++)
+        write32(port_base + 0x3000 + 4 * i, 0);
+    for (int i = 0; i < 256; i++)
+        write32(port_base + APCIE_T602X_PORT_MSIMAP + 4 * i, 0);
+    write32(port_base + 0x130, T8142_PORT_TUNE_130);
+    write32(port_base + 0x140, 0x10);
+    write32(port_base + 0x144, 0x253770);
+    write32(port_base + 0x21c, 0x0);
+    write32(port_base + 0x834, 0x0);
+    write32(port_base + 0x83c, 0x0);
+
+    if (tunables_apply_local_addr(bridge, "apcie-config-tunables", port_base)) {
+        printf("pcie: t8142: error applying apcie-config-tunables\n");
+        return -1;
+    }
+
+    set32(port_base + APCIE_PORT_APPCLK, APCIE_PORT_APPCLK_EN);
+    udelay(10);
+    set32(lane + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0REQ);
+    if (poll32(lane + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0ACK, APCIE_PHY_CTRL_CLK0ACK, 50000)) {
+        printf("pcie: t8142: port %d lane CLK0 timeout\n", port);
+        return -1;
+    }
+    set32(lane + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1REQ);
+    if (poll32(lane + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1ACK, APCIE_PHY_CTRL_CLK1ACK, 50000)) {
+        printf("pcie: t8142: port %d lane CLK1 timeout\n", port);
+        return -1;
+    }
+    clear32(lane + APCIE_PHY_CTRL, 0x10);
+    udelay(100);
+    set32(lane + APCIE_PHY_CTRL, 0x200);
+    set32(lane + APCIE_PHY_CTRL, 0x400);
+    udelay(100);
+
+    set32(port_base + APCIE_T602X_PORT_RESET, APCIE_PORT_RESET_DIS);
+    if (pad) {
+        u32 t = 100;
+        ADT_GETPROP(adt, bridge_offset, "t-refclk-to-perst", &t);
+        udelay(t);
+        mask32(pad, 0xf, T8142_GPIO_OUT_HIGH);
+    }
+    v = 100;
+    ADT_GETPROP(adt, bridge_offset, "perst-to-config", &v);
+    mdelay(v);
+    clear32(port_base + APCIE_T602X_PORT_RESET, BIT(16));
+
+    if (poll32(port_base + APCIE_PORT_STATUS, APCIE_PORT_STATUS_RUN, APCIE_PORT_STATUS_RUN,
+               250000)) {
+        printf("pcie: t8142: port %d failed to come up\n", port);
+        return -1;
+    }
+    clear32(port_base + APCIE_PORT_APPCLK, 0x100);
+
+    set32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
+    if (tunables_apply_local_addr(bridge, "pcie-rc-tunables", config_base) ||
+        tunables_apply_local_addr(bridge, "pcie-rc-gen3-shadow-tunables", config_base) ||
+        tunables_apply_local_addr(bridge, "pcie-rc-gen4-shadow-tunables", config_base)) {
+        printf("pcie: t8142: error applying RC tunables\n");
+        return -1;
+    }
+    u32 max_speed;
+    if (ADT_GETPROP(adt, bridge_offset, "maximum-link-speed", &max_speed) >= 0 && max_speed) {
+        mask32(config_base + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_SLS,
+               FIELD_PREP(PCIE_LNKCAP_SLS, max_speed));
+        mask32(config_base + PCIE_CAP_BASE + PCIE_LNKCAP2, PCIE_LNKCAP2_SLS,
+               FIELD_PREP(PCIE_LNKCAP2_SLS, (1 << max_speed) - 1));
+        mask16(config_base + PCIE_CAP_BASE + PCIE_LNKCTL2, PCIE_LNKCTL2_TLS,
+               FIELD_PREP(PCIE_LNKCTL2_TLS, max_speed));
+    }
+    clear32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
+
+    set32(lane + APCIE_PHY_CTRL, BIT(31));
+    set32(port_base + T8142_PORT_LTSSM_EN, 1);
+    for (v = 0; v < 2000; v++) {
+        if ((read32(config_base + T8142_RC_LTSSM) & 0x3f) == T8142_LTSSM_L0)
+            break;
+        udelay(1000);
+    }
+    if (v == 2000) {
+        printf("pcie: t8142: port %d link training failed (LTSSM %#x)\n", port,
+               read32(config_base + T8142_RC_LTSSM) & 0x3f);
+        return -1;
+    }
+    printf("pcie: t8142: port %d link up after %d ms (root %08x)\n", port, v,
+           read32(config_base));
+    return 0;
+}
+
+static int pcie_t8142_init(const char *path, int *adt_path, int adt_offset)
+{
+    u64 config_base, rc_base, phy_base, phyctl, phy_ip, rc_size;
+    u32 ports, reg_len;
+    int ret = 0;
+
+    if (ADT_GETPROP(adt, adt_offset, "#ports", &ports) < 0 ||
+        !adt_getprop(adt, adt_offset, "reg", &reg_len) ||
+        reg_len != 16 * (T8142_SHARED_REGS + T8142_PORT_REGS * ports) ||
+        adt_get_reg(adt, adt_path, "reg", 0, &config_base, NULL) ||
+        adt_get_reg(adt, adt_path, "reg", T8142_REG_RC, &rc_base, &rc_size) ||
+        adt_get_reg(adt, adt_path, "reg", T8142_REG_PHY, &phy_base, NULL) ||
+        adt_get_reg(adt, adt_path, "reg", T8142_REG_PHYCTL, &phyctl, NULL) ||
+        adt_get_reg(adt, adt_path, "reg", T8142_REG_PHYIP, &phy_ip, NULL)) {
+        printf("pcie: t8142: unexpected ADT layout\n");
+        return -1;
+    }
+
+    if (pmgr_adt_power_enable(path)) {
+        printf("pcie: t8142: error enabling power\n");
+        return -1;
+    }
+    if (tunables_apply_local(path, "apcie-axi2af-tunables", T8142_REG_AXI) ||
+        tunables_apply_local(path, "apcie-phy-tunables", T8142_REG_PHY)) {
+        printf("pcie: t8142: error applying controller tunables\n");
+        return -1;
+    }
+    write32(rc_base + 0x4, 0);
+
+    set32(phyctl + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0REQ);
+    if (poll32(phyctl + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0ACK, APCIE_PHY_CTRL_CLK0ACK, 50000)) {
+        printf("pcie: t8142: PHY CLK0 timeout\n");
+        return -1;
+    }
+    set32(phyctl + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1REQ);
+    if (poll32(phyctl + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1ACK, APCIE_PHY_CTRL_CLK1ACK, 50000)) {
+        printf("pcie: t8142: PHY CLK1 timeout\n");
+        return -1;
+    }
+    clear32(phyctl + APCIE_PHY_CTRL, APCIE_PHY_CTRL_RESET_T8132);
+    udelay(1);
+    set32(phyctl + 4, 0x01);
+    if (tunables_apply_local_addr(path, "apcie-phy-ip-pll-tunables", phy_ip) ||
+        tunables_apply_local_addr(path, "apcie-phy-ip-auspma-tunables", phy_ip)) {
+        printf("pcie: t8142: error applying PHY IP tunables\n");
+        return -1;
+    }
+    set32(phyctl + 4, 0x10);
+    mask32(phy_base + T8142_PHYCMN_OFFSET + APCIE_PHYCMN_CLK, APCIE_PHYCMN_CLK_MODE,
+           FIELD_PREP(APCIE_PHYCMN_CLK_MODE, APCIE_PHYCMN_CLK_MODE_ON));
+    if (poll32(phyctl + 0x8, 1, 1, 250000)) {
+        printf("pcie: t8142: PHY clock enable timed out\n");
+        return -1;
+    }
+    set32(phyctl + APCIE_PHY_CTRL, 0x200);
+    write32(rc_base + 0x54, 0x140);
+    write32(rc_base + 0x50, 0x1);
+    if (poll32(rc_base + 0x58, 1, 1, 250000)) {
+        printf("pcie: t8142: RC init timed out\n");
+        return -1;
+    }
+
+    for (u32 port = 0; port < ports; port++)
+        ret |= pcie_t8142_port(path, adt_path, port, config_base + ((u64)port << 15));
+
+    printf("pcie: t8142: controller %s\n", ret ? "partially up" : "up");
+    return ret;
+}
+
 static int pcie_init_controller(int controller, const char *path)
 {
     struct state *state = &controllers[controller];
@@ -274,6 +515,11 @@ static int pcie_init_controller(int controller, const char *path)
     if (adt_offset < 0) {
         printf("pcie: Error getting node %s\n", path);
         return -1;
+    }
+
+    if (adt_is_compatible(adt, adt_offset, "apcie,t8142")) {
+        printf("pcie: Initializing t8142 PCIe controller\n");
+        return pcie_t8142_init(path, adt_path, adt_offset);
     }
 
     if (adt_is_compatible(adt, adt_offset, "apcie,t8103")) {
