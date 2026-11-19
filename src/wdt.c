@@ -57,3 +57,11 @@ void wdt_reboot(void)
     write32(wdt_base + WDT_COUNT, 0);
     write32(wdt_base + WDT_CTL, 4);
 }
+
+// XXX M5 dev loop: restart the primary WDT count (harmless when it is disabled; CTL does not
+// read back the enable bit on T8142, so don't test it).
+void wdt_kick(void)
+{
+    if (wdt_base)
+        write32(wdt_base + WDT_COUNT, 0);
+}

@@ -13,6 +13,7 @@
 #include "string.h"
 #include "usb.h"
 #include "utils.h"
+#include "wdt.h"
 
 #define HV_TICK_RATE      1000
 #define HV_SLOW_TICK_RATE 1
@@ -596,6 +597,18 @@ void hv_tick(struct exc_info *ctx)
     if (dbg)
         printf("HVDBG: tick %d: wdt_pet\n", dbg_ticks); iodev_console_flush();
     hv_wdt_pet();
+    // XXX M5 dev loop: the host arms the primary WDT with a short alarm; keep it from firing
+    // while the HV ticks, for at most HV_HW_WDT_MAX_S. A frozen machine (no ticks) then resets
+    // within the alarm instead of after the whole run budget.
+    {
+#define HV_HW_WDT_MAX_S 170
+        static u64 first_tick;
+        u64 now = get_ticks();
+        if (!first_tick)
+            first_tick = now;
+        if (now - first_tick < HV_HW_WDT_MAX_S * 24000000UL)
+            wdt_kick();
+    }
     if (dbg)
         printf("HVDBG: tick: usb events\n"); iodev_console_flush();
     iodev_handle_events(uartproxy_iodev);
