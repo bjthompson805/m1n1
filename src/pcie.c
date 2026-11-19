@@ -317,6 +317,11 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
         }
         pad = gpio_base + 4 * f[2];
         mask32(pad, 0xf, T8142_GPIO_OUT_LOW);
+        /* XXX bring-up: function-clkreq = GPIO(0xa4, 2), untouched so far */
+        const u32 *c = adt_getprop(adt, bridge_offset, "function-clkreq", &len);
+        if (c && len >= 16)
+            printf("pcie: t8142: port %d clkreq pin %#x reg %08x\n", port, c[2],
+                   read32(gpio_base + 4 * c[2]));
     }
 
     /*
