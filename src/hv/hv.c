@@ -606,7 +606,7 @@ void hv_tick(struct exc_info *ctx)
         u64 now = get_ticks();
         if (!first_tick)
             first_tick = now;
-        if (now - first_tick < HV_HW_WDT_MAX_S * 24000000UL)
+        if (now - first_tick < HV_HW_WDT_MAX_S * mrs(CNTFRQ_EL0))
             wdt_kick();
     }
     if (dbg)
