@@ -1535,7 +1535,9 @@ class HV(Reloadable):
 
         def wh(base, off, data, width):
             self.log(f"PMGR W {base:x}+{off:x}:{width} = 0x{data:x}: Dangerous write")
-            self.p.mask32(base + off, 0x3ff, (data | 0xf) & ~(0x80000400))
+            # Emulate only: leave the hardware register (UART/USB domains the hypervisor itself
+            # depends on) exactly as it is. On T8142 rewriting bits 8-9/28 kills the USB link.
+            pass
             _pmgr[base + off] = (data & 0xfffffc0f) | ((data & 0xf) << 4)
 
         def rh(base, off, width):
