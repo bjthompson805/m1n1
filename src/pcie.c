@@ -331,12 +331,21 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
      */
     f = adt_getprop(adt, bridge_offset, "function-reset", &len);
     if (f && len >= 16 && (!memcmp(&f[1], "4WKp", 4) || !memcmp(&f[1], "pKW4", 4))) {
+        /*
+         * XXX bring-up: macOS also raises SMC gp0e (same template) right after gP13;
+         * without it the N1 Wi-Fi function (alpha) never leaves exec stage 0.
+         */
+        const u32 gp0e = 0x67703065;
         smc_dev_t *smc = smc_init();
         int err = !smc || smc_write_u32(smc, f[2], f[3]);
+        if (!err)
+            err = smc_write_u32(smc, gp0e, f[3]);
         if (!err) {
             mdelay(250);
             err = smc_write_u32(smc, f[2], f[3] | 1);
         }
+        if (!err)
+            err = smc_write_u32(smc, gp0e, f[3] | 1);
         if (smc)
             smc_shutdown(smc);
         if (err) {
