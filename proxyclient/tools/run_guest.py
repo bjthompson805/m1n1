@@ -16,6 +16,8 @@ parser.add_argument('-c', '--command', action="append", default=[])
 parser.add_argument('-S', '--shell', action="store_true")
 parser.add_argument('-e', '--hook-exceptions', action="store_true")
 parser.add_argument('-d', '--debug-xnu', action="store_true")
+parser.add_argument('--keep-pmu-panic-counter', action="store_true",
+                    help='Preserve the PMU panic counter when starting the guest.')
 parser.add_argument('-l', '--logfile', type=pathlib.Path)
 parser.add_argument('-C', '--cpus', default=None)
 parser.add_argument('--strip-node', action="append", default=[], metavar='SUBSTR',
@@ -158,7 +160,8 @@ elif args.sptm:
 else:
     hv.load_macho(payload, symfile=symfile)
 
-PMU(u).reset_panic_counter()
+if not args.keep_pmu_panic_counter:
+    PMU(u).reset_panic_counter()
 
 for i in args.script:
     try:
