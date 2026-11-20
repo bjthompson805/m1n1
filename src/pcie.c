@@ -462,6 +462,21 @@ static int pcie_t8142_port(const char *path, int *adt_path, u32 port, u64 config
     }
     printf("pcie: t8142: port %d link up after %d ms (root %08x)\n", port, v,
            read32(config_base));
+
+    /*
+     * XXX bring-up: after enumeration and before the ROM doorbell, macOS writes SMC gP1c
+     * 0x10001, 0x10001, 0x10000 on the N1 port.
+     */
+    if (f && len >= 16 && (!memcmp(&f[1], "4WKp", 4) || !memcmp(&f[1], "pKW4", 4))) {
+        static const u32 gp1c_seq[] = {0x10001, 0x10001, 0x10000};
+        smc_dev_t *smc = smc_init();
+        int err = !smc;
+        for (int i = 0; !err && i < 3; i++)
+            err = smc_write_u32(smc, 0x67503163, gp1c_seq[i]);
+        if (smc)
+            smc_shutdown(smc);
+        printf("pcie: t8142: port %d gP1c sequence %s\n", port, err ? "failed" : "done");
+    }
     return 0;
 }
 
