@@ -490,6 +490,223 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
     return 0;
 }
 
+/*
+ * T8142 (M5): iBoot loads both GPU ASC roles. The driver checks the loaded images itself
+ * (TEXT digest, DATA span), so publish iBoot's regions as they are and the loaded segments
+ * as fw-text / fw-data.
+ */
+#define T8142_FW_TEXT_SIZE 0x9c000
+#define T8142_FW_DATA_SIZE 0x184000
+#define T8142_MAX_SEGS     8
+
+struct gpu_fw_span {
+    u64 start;
+    u64 end;
+};
+
+static int t8142_add_segments(const char *path, struct gpu_fw_span *text, struct gpu_fw_span *data,
+                              u64 *data_bytes)
+{
+    int node = adt_path_offset(adt, path);
+    if (node < 0)
+        bail("ADT: GPU: %s not found\n", path);
+
+    u32 len;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg) || len / sizeof(*seg) > T8142_MAX_SEGS)
+        bail("ADT: GPU: invalid segment-ranges in %s\n", path);
+
+    bool have_text = false;
+    for (u32 i = 0; i < len / sizeof(*seg); i++, seg++) {
+        char name[32];
+        if (adt_get_segment_name(adt, node, i, name, sizeof(name)))
+            bail("ADT: GPU: %s segment %d has no name\n", path, i);
+
+        u64 start = seg->phys, end = seg->phys + seg->size;
+        printf("ADT: GPU: %s %s phys 0x%lx size 0x%x\n", path, name, start, seg->size);
+
+        struct gpu_fw_span *span;
+        if (!strcmp(name, "__TEXT")) {
+            have_text = true;
+            span = text;
+        } else if (!strcmp(name, "__DATA") || !strcmp(name, "__DATA_SHARED_RO")) {
+            span = data;
+            *data_bytes += seg->size;
+        } else {
+            continue;
+        }
+
+        if (!seg->size || (start & (SZ_16K - 1)) || (seg->size & (SZ_16K - 1)))
+            bail("ADT: GPU: %s %s is not 16K aligned\n", path, name);
+
+        if (!span->end) {
+            span->start = start;
+            span->end = end;
+        } else if (start == span->end) {
+            span->end = end;
+        } else if (end == span->start) {
+            span->start = start;
+        } else {
+            bail("ADT: GPU: %s %s at 0x%lx is not contiguous with 0x%lx..0x%lx\n", path, name,
+                 start, span->start, span->end);
+        }
+    }
+
+    if (!have_text)
+        bail("ADT: GPU: %s has no __TEXT\n", path);
+
+    return 0;
+}
+
+/* Adds a reserved-memory node and appends it to the GPU node's memory-region list. */
+static int t8142_add_gpu_region(void *dt, const char *name, u64 base, u64 size)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    if (resv < 0)
+        bail("FDT: GPU: /reserved-memory not found\n");
+
+    int node = fdt_subnode_offset(dt, resv, name);
+    if (node < 0)
+        node = fdt_add_subnode(dt, resv, name);
+    if (node < 0)
+        bail("FDT: GPU: failed to add %s\n", name);
+
+    u32 phandle = fdt_get_phandle(dt, node);
+    if (!phandle &&
+        (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, node, "phandle", phandle)))
+        bail("FDT: GPU: failed to set phandle of %s\n", name);
+
+    fdt64_t reg[2];
+    fdt64_st(&reg[0], base);
+    fdt64_st(&reg[1], size);
+    if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)))
+        bail("FDT: GPU: failed to set reg of %s\n", name);
+
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        bail("FDT: GPU: gpu alias not found\n");
+    if (fdt_stringlist_search(dt, gpu, "memory-region-names", name) >= 0)
+        return 0;
+
+    if (fdt_appendprop_u32(dt, gpu, "memory-region", phandle))
+        bail("FDT: GPU: failed to append memory-region\n");
+    gpu = fdt_path_offset(dt, "gpu");
+    if (fdt_appendprop_string(dt, gpu, "memory-region-names", name))
+        bail("FDT: GPU: failed to append memory-region-names\n");
+
+    return 0;
+}
+
+static int dt_set_gpu_t8142(void *dt)
+{
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0)
+        bail("ADT: GPU: /arm-io/sgx node not found\n");
+
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0) {
+        printf("FDT: GPU: gpu alias not found in device tree\n");
+        return 0;
+    }
+    if (fdt_node_check_compatible(dt, gpu, "apple,agx-t8142")) {
+        printf("FDT: GPU: gpu node is not apple,agx-t8142, skipping\n");
+        return 0;
+    }
+
+    /* Validate the loaded firmware layout before publishing anything. */
+    struct gpu_fw_span text = {0}, data = {0};
+    u64 data_bytes = 0;
+    if (t8142_add_segments("/arm-io/gfx-asc", &text, &data, &data_bytes))
+        return -1;
+    if (t8142_add_segments("/arm-io/gfx1-asc", &text, &data, &data_bytes))
+        return -1;
+
+    printf("FDT: GPU: fw-text 0x%lx..0x%lx, fw-data 0x%lx..0x%lx\n", text.start, text.end,
+           data.start, data.end);
+    if (text.end - text.start != T8142_FW_TEXT_SIZE)
+        bail("FDT: GPU: fw-text size 0x%lx, expected 0x%x\n", text.end - text.start,
+             T8142_FW_TEXT_SIZE);
+    if (data.end - data.start != T8142_FW_DATA_SIZE || data_bytes != T8142_FW_DATA_SIZE)
+        bail("FDT: GPU: fw-data span 0x%lx (0x%lx in segments), expected 0x%x\n",
+             data.end - data.start, data_bytes, T8142_FW_DATA_SIZE);
+
+    u32 perf_state_count, perf_state_table_count, len;
+    if (ADT_GETPROP(adt, sgx, "perf-state-count", &perf_state_count) < 0 || !perf_state_count ||
+        perf_state_count > MAX_PSTATES)
+        bail("ADT: GPU: bad perf-state-count\n");
+    if (ADT_GETPROP(adt, sgx, "perf-state-table-count", &perf_state_table_count) < 0 ||
+        perf_state_table_count != 1)
+        bail("ADT: GPU: unexpected perf-state-table-count\n");
+    const struct perf_state *perf_states = adt_getprop(adt, sgx, "perf-states", &len);
+    if (!perf_states || len != sizeof(*perf_states) * perf_state_count)
+        bail("ADT: GPU: invalid perf-states length\n");
+
+    /* iBoot's UAT handoff and the firmware DATA regions, as named in the SGX node. */
+    if (dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs"))
+        return -1;
+    if (dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables"))
+        return -1;
+    if (dt_set_region(dt, sgx, "gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables"))
+        return -1;
+    if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff"))
+        return -1;
+    if (dt_set_region(dt, sgx, "gfx-data", "/reserved-memory/gfx-data"))
+        return -1;
+    if (dt_set_region(dt, sgx, "gfx1-data", "/reserved-memory/gfx1-data"))
+        return -1;
+    if (dt_set_resvmem(dt, "/reserved-memory/fw-data", data.start, data.end - data.start))
+        return -1;
+    if (t8142_add_gpu_region(dt, "fw-text", text.start, text.end - text.start))
+        return -1;
+
+    /* iBoot-owned memory that the firmware is running from: keep the kernel off it. */
+    static const char *const regions[] = {
+        "uat-ttbs", "uat-pagetables", "uat-l2-pagetables", "uat-handoff",
+        "gfx-data", "gfx1-data",      "fw-data",           "fw-text",
+    };
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    for (u32 j = 0; j < ARRAY_SIZE(regions); j++) {
+        int node = fdt_subnode_offset(dt, resv, regions[j]);
+        if (node < 0 || fdt_setprop_empty(dt, node, "no-map"))
+            bail("FDT: GPU: failed to set no-map on %s\n", regions[j]);
+        resv = fdt_path_offset(dt, "/reserved-memory");
+    }
+
+    /* OPPs in perf-state order. */
+    gpu = fdt_path_offset(dt, "gpu");
+    int plen;
+    const fdt32_t *opps_ph = fdt_getprop(dt, gpu, "operating-points-v2", &plen);
+    if (!opps_ph || plen != 4)
+        bail("FDT: GPU: operating-points-v2 not found\n");
+    int opps = fdt_node_offset_by_phandle(dt, fdt32_ld(opps_ph));
+    if (opps < 0)
+        bail("FDT: GPU: OPP table not found\n");
+
+    u32 i = 0;
+    int opp;
+    fdt_for_each_subnode(opp, dt, opps)
+    {
+        if (i >= perf_state_count)
+            bail("FDT: GPU: Expected %d operating points, but found more\n", perf_state_count);
+        if (fdt_setprop_inplace_u32(dt, opp, "opp-microvolt", perf_states[i].volt * 1000))
+            bail("FDT: GPU: Failed to set opp-microvolt for PS %d\n", i);
+        if (fdt_setprop_inplace_u64(dt, opp, "opp-hz", perf_states[i].freq))
+            bail("FDT: GPU: Failed to set opp-hz for PS %d\n", i);
+        i++;
+    }
+    if (i != perf_state_count)
+        bail("FDT: GPU: Expected %d operating points, but found %d\n", perf_state_count, i);
+
+    gpu = fdt_path_offset(dt, "gpu");
+    if (firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
+        return -1;
+    gpu = fdt_path_offset(dt, "gpu");
+    firmware_set_fdt(dt, gpu, "apple,firmware-compat", &os_firmware);
+
+    printf("FDT: GPU: T8142 handoff published (%d OPPs)\n", perf_state_count);
+    return 0;
+}
+
 int dt_set_gpu(void *dt)
 {
     bool has_cs_afr = false;
@@ -500,6 +717,13 @@ int dt_set_gpu(void *dt)
     u32 dies = 1;
 
     printf("FDT: GPU: Initializing GPU info\n");
+
+    if (chip_id == T8142) {
+        /* Not fatal: the rest of the boot does not depend on the GPU handoff. */
+        if (dt_set_gpu_t8142(dt))
+            printf("FDT: GPU: T8142 handoff not published\n");
+        return 0;
+    }
 
     switch (chip_id) {
         case T8103:
