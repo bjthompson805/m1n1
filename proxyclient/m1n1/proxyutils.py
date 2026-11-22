@@ -240,23 +240,26 @@ class ProxyUtils(Reloadable):
 
     inst = exec
 
+    # Payloads larger than the proxy heap go in pieces of this size.
+    COMPRESSED_CHUNK = 32 << 20
+
     def compressed_writemem(self, dest, data, progress=None):
-        if not len(data):
-            return
+        for off in range(0, len(data), self.COMPRESSED_CHUNK):
+            chunk = data[off:off + self.COMPRESSED_CHUNK]
+            payload = gzip.compress(chunk, compresslevel=1)
+            compressed_size = len(payload)
 
-        payload = gzip.compress(data, compresslevel=1)
-        compressed_size = len(payload)
+            with self.heap.guarded_malloc(compressed_size) as compressed_addr:
+                self.iface.writemem(compressed_addr, payload, progress)
+                timeout = self.iface.dev.timeout
+                self.iface.dev.timeout = None
+                try:
+                    decompressed_size = self.proxy.gzdec(compressed_addr, compressed_size,
+                                                         dest + off, len(chunk))
+                finally:
+                    self.iface.dev.timeout = timeout
 
-        with self.heap.guarded_malloc(compressed_size) as compressed_addr:
-            self.iface.writemem(compressed_addr, payload, progress)
-            timeout = self.iface.dev.timeout
-            self.iface.dev.timeout = None
-            try:
-                decompressed_size = self.proxy.gzdec(compressed_addr, compressed_size, dest, len(data))
-            finally:
-                self.iface.dev.timeout = timeout
-
-            assert decompressed_size == len(data)
+                assert decompressed_size == len(chunk)
 
     def get_adt(self):
         if self.adt_data is not None:
