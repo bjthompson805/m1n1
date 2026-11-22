@@ -71,44 +71,40 @@ void get_device_info(void)
     printf("\n");
 }
 
-void run_actions(__maybe_unused u64 lp_sip0)
+static void run_actions(void)
 {
     bool usb_up = false;
 
-#ifndef BRINGUP
-#ifdef EARLY_PROXY_TIMEOUT
-    if (!cur_boot_args.video.display && lp_sip0 == 127) {
-        printf("Bringing up USB for early debug...\n");
+#if !defined(BRINGUP) && defined(EARLY_PROXY_TIMEOUT)
+    printf("Bringing up USB for early debug...\n");
 
-        usb_init();
-        usb_iodev_init();
+    usb_init();
+    usb_iodev_init();
 
-        usb_up = true;
+    usb_up = true;
 
-        printf("Waiting for proxy connection... ");
-        for (int i = 0; i < EARLY_PROXY_TIMEOUT * 100; i++) {
-            for (int j = 0; j < USB_IODEV_COUNT; j++) {
-                iodev_id_t iodev = IODEV_USB0 + j;
+    printf("Waiting for proxy connection... ");
+    for (int i = 0; i < EARLY_PROXY_TIMEOUT * 100; i++) {
+        for (int j = 0; j < USB_IODEV_COUNT; j++) {
+            iodev_id_t iodev = IODEV_USB0 + j;
 
-                if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
-                    continue;
+            if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
+                continue;
 
-                usb_iodev_vuart_setup(iodev);
-                iodev_handle_events(iodev);
-                if (iodev_can_write(iodev) || iodev_can_write(IODEV_USB_VUART)) {
-                    printf(" Connected!\n");
-                    uartproxy_run(NULL);
-                    return;
-                }
+            usb_iodev_vuart_setup(iodev);
+            iodev_handle_events(iodev);
+            if (iodev_can_write(iodev) || iodev_can_write(IODEV_USB_VUART)) {
+                printf(" Connected!\n");
+                uartproxy_run(NULL);
+                return;
             }
-
-            mdelay(10);
-            if (i % 100 == 99)
-                printf(".");
         }
-        printf(" Timed out\n");
+
+        mdelay(10);
+        if (i % 100 == 99)
+            printf(".");
     }
-#endif
+    printf(" Timed out\n");
 #endif
 
     printf("Checking for payloads...\n");
@@ -189,7 +185,7 @@ void m1n1_main(void)
 
     printf("Initialization complete.\n");
 
-    run_actions(lp_sip0);
+    run_actions();
 
     if (!next_stage.entry) {
         panic("Nothing to do!\n");

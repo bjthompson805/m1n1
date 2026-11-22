@@ -9,12 +9,15 @@ parser = argparse.ArgumentParser(description='Mach-O loader for m1n1')
 parser.add_argument('-q', '--quiet', action="store_true", help="Disable framebuffer")
 parser.add_argument('-n', '--no-sepfw', action="store_true", help="Do not preserve SEPFW")
 parser.add_argument('-c', '--call', action="store_true", help="Use call mode")
+parser.add_argument('--no-wait', action="store_true", help="Do not reconnect after vector handoff")
 parser.add_argument('-r', '--raw', action="store_true", help="Image is raw")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainloading XNU")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
+if args.call and args.no_wait:
+    parser.error("--no-wait requires vector handoff")
 
 from m1n1.setup import *
 from m1n1.tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
@@ -85,19 +88,6 @@ if args.xnu:
             if hasattr(nub, "segment_names"):
                 remove_oslog(nub)
 
-rvbar = entry & ~0xfff
-if rvbar != u.base:
-    print("Setting secondary CPU RVBARs...")
-
-    for cpu in u.adt["cpus"]:
-        if cpu.state == "running":
-            continue
-        addr, size = cpu.cpu_impl_reg
-        print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
-        p.write64(addr, rvbar)
-
-u.push_adt()
-
 print("Setting up bootargs...")
 tba = u.ba.copy()
 
@@ -144,6 +134,19 @@ iface.writemem(stub.addr, stub.data)
 p.dc_cvau(stub.addr, stub.len)
 p.ic_ivau(stub.addr, stub.len)
 
+rvbar = entry & ~0xfff
+if rvbar != u.base:
+    print("Setting secondary CPU RVBARs...")
+
+    for cpu in u.adt["cpus"]:
+        if cpu.state == "running":
+            continue
+        addr, size = cpu.cpu_impl_reg
+        print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
+        p.write64(addr, rvbar)
+
+u.push_adt()
+
 print(f"Entry point: 0x{entry:x}")
 
 if args.xnu and p.display_is_external():
@@ -160,7 +163,11 @@ if args.call:
     p.call(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size, reboot=True)
 else:
     print(f"Reloading into stub at 0x{stub.addr:x}")
-    p.reload(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size)
+    vector_args = (stub.addr, new_base + bootargs_off, image_addr, new_base, image_size)
+    if args.no_wait:
+        p.request(p.P_VECTOR, *vector_args)
+        sys.exit(0)
+    p.reload(*vector_args)
 
 iface.nop()
 print("Proxy is alive again")

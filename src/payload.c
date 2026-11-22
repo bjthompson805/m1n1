@@ -12,7 +12,9 @@
 #include "heapblock.h"
 #include "kboot.h"
 #include "mitigations.h"
+#include "nvme.h"
 #include "smp.h"
+#include "soc.h"
 #include "utils.h"
 
 #include "libfdt/libfdt.h"
@@ -43,6 +45,14 @@ static char expect_compatible[256];
 static struct kernel_header *kernel = NULL;
 static void *fdt = NULL;
 static char *chainload_spec = NULL;
+static void *payload_start = _payload_start;
+
+#ifdef M5_PACKED_BOOT_PAYLOAD
+void payload_set_start(void *start)
+{
+    payload_start = start;
+}
+#endif
 
 static void *load_one_payload(void *start, size_t size);
 
@@ -271,7 +281,7 @@ void do_enable_tso(void)
 
 bool payload_logo(void **custom_128, void **custom_256)
 {
-    void *p = _payload_start;
+    void *p = payload_start;
 
     *custom_128 = NULL;
     *custom_256 = NULL;
@@ -304,7 +314,7 @@ int payload_run(void)
         return -1;
     }
 
-    void *p = _payload_start;
+    void *p = payload_start;
 
     while (p)
         p = load_one_payload(p, 0);
@@ -314,6 +324,16 @@ int payload_run(void)
     }
 
     if (kernel && fdt) {
+#ifdef M5_NVME_BOOT_PRIME
+        if (chip_id == T8142) {
+            printf("Preparing ANS for the boot payload...\n");
+            if (!nvme_init()) {
+                printf("Failed to initialize ANS\n");
+                return -1;
+            }
+            nvme_shutdown();
+        }
+#endif
         cpufreq_init();
         smp_start_secondaries();
         mitigations_perform();

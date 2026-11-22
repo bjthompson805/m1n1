@@ -5,6 +5,7 @@
 #include "dockchannel_uart.h"
 #include "exception.h"
 #include "firmware.h"
+#include "payload.h"
 #include "smp.h"
 #include "string.h"
 #include "types.h"
@@ -164,9 +165,40 @@ void _start_c(void *boot_args, void *base)
     UNUSED(base);
     u32 cpu_id = 0;
 
+#ifdef M5_PACKED_BOOT_PAYLOAD
+    /* Preserve the packed payload before clearing the raw image's BSS. */
+    const char magic[] = "m1n1bss!";
+    u32 packed_size = 0;
+    void *packed_payload = NULL;
+    u64 packed_end = 0;
+    if (!memcmp(_bss_start, magic, sizeof(magic) - 1)) {
+        const char *header = _bss_start + sizeof(magic) - 1;
+        memcpy(&packed_size, header, sizeof(packed_size));
+        const char *data = header + sizeof(packed_size);
+        if (packed_size && packed_size <= (size_t)(_bss_end - data)) {
+            const struct boot_args *args = boot_args;
+            u64 start = ALIGN_UP(args->top_of_kernel_data, (u64)SZ_16K);
+            u64 end = ALIGN_UP(start + packed_size + 64, (u64)SZ_16K);
+            if (start >= (u64)_payload_start && end > start &&
+                end - args->phys_base <= args->mem_size) {
+                packed_payload = (void *)start;
+                packed_end = end;
+                memcpy(packed_payload, data, packed_size);
+                memset((char *)packed_payload + packed_size, 0, 64);
+            }
+        }
+    }
+#endif
+
     memset64(_bss_start, 0, _bss_end - _bss_start);
     boot_args_addr = (u64)boot_args;
     memcpy(&cur_boot_args, boot_args, sizeof(cur_boot_args));
+#ifdef M5_PACKED_BOOT_PAYLOAD
+    if (packed_payload) {
+        payload_set_start(packed_payload);
+        cur_boot_args.top_of_kernel_data = packed_end;
+    }
+#endif
 
     adt =
         (void *)(((u64)cur_boot_args.devtree) - cur_boot_args.virt_base + cur_boot_args.phys_base);
