@@ -407,6 +407,10 @@ static void hv_enter_secondary(void *entry, const u64 regs[4])
      */
     hv_started_cpus[smp_id()] = true;
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
+    if (HV_DBG_SECONDARY) {
+        printf("HVDBG: cpu%d jumping to guest at %p\n", smp_id(), entry);
+        iodev_console_flush();
+    }
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
     spin_lock(&bhl);

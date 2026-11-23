@@ -43,6 +43,12 @@ static_assert(HV_VREG_MAX - 1 <= FIELD_GET(HV_HVC_SYSREG_VREG, HV_HVC_SYSREG_VRE
               "Virtual register IDs must fit in the HVC immediate");
 
 static struct hv_sprr_cpu hv_sprr_cpus[MAX_CPUS];
+/*
+ * The shadow cache, the table pool and the guest page-table tracking are shared by all CPUs,
+ * and the MSR/ERET traps reach them without the big HV lock: every public entry point that
+ * touches them takes sprr_lock (recursive; taken after bhl on the slow paths).
+ */
+static DECLARE_SPINLOCK(sprr_lock);
 static struct hv_sprr_shadow sprr_shadows[SPRR_N_CACHED_SHADOWS];
 static u32 sprr_lru_clock;
 
@@ -377,12 +383,12 @@ static void sprr_wp_untrack(struct sprr_mirror *mirror)
     free(wp);
 }
 
-bool hv_sprr_is_pt_page(u64 ipa)
+static bool hv_sprr_is_pt_page_locked(u64 ipa)
 {
     return sprr_wp_find(ipa) != NULL;
 }
 
-bool hv_sprr_is_shadow_page(u64 ipa)
+static bool hv_sprr_is_shadow_page_locked(u64 ipa)
 {
     for (struct sprr_chunk *chunk = sprr_chunks; chunk; chunk = chunk->next)
         if (ipa >= chunk->base && ipa < chunk->end)
@@ -413,7 +419,7 @@ static struct {
     u8 *data;
 } sprr_commpage;
 
-bool hv_sprr_is_commpage(u64 ipa)
+static bool hv_sprr_is_commpage_locked(u64 ipa)
 {
     if (hv_sptm_mode != SPTM_EMULATION)
         return false;
@@ -424,7 +430,7 @@ bool hv_sprr_is_commpage(u64 ipa)
     return true;
 }
 
-void hv_sprr_commpage_updated(u64 ipa, u64 bytes)
+static void hv_sprr_commpage_updated_locked(u64 ipa, u64 bytes)
 {
     u64 off = ipa - sprr_commpage.ipa;
     u64 end = off + bytes;
@@ -718,7 +724,7 @@ static struct sprr_mirror *sprr_mirror_table(struct exc_info *ctx, struct hv_spr
 }
 
 // if a guest tries to edit its own pagetables from EL0/GL0 something is terribly wrong
-void hv_sprr_pt_writer_check(struct exc_info *ctx, u64 ipa, u64 far)
+static void hv_sprr_pt_writer_check_locked(struct exc_info *ctx, u64 ipa, u64 far)
 {
     if (FIELD_GET(SPSR_M, ctx->spsr) != SPSR_M_EL0)
         return;
@@ -729,7 +735,7 @@ void hv_sprr_pt_writer_check(struct exc_info *ctx, u64 ipa, u64 far)
     hv_exc_proxy(ctx, START_HV, HV_PANIC, NULL);
 }
 
-void hv_sprr_pt_updated(struct exc_info *ctx, u64 ipa, u64 bytes)
+static void hv_sprr_pt_updated_locked(struct exc_info *ctx, u64 ipa, u64 bytes)
 {
     struct sprr_wp_page *wp = sprr_wp_find(ipa);
     if (!wp)
@@ -1139,7 +1145,7 @@ bool hv_sprr_traps_tlbi(void)
     return hv_sptm_mode == SPTM_EMULATION && hv_sprr_this()->mmu->sprr_en;
 }
 
-bool hv_sprr_handle_msr(struct exc_info *ctx, u64 reg, u32 rt, bool is_read)
+static bool hv_sprr_handle_msr_locked(struct exc_info *ctx, u64 reg, u32 rt, bool is_read)
 {
     struct hv_sprr_cpu *cpu = hv_sprr_this();
 
@@ -1685,7 +1691,7 @@ static bool hv_sprr_emulate_sysreg(struct exc_info *ctx, u32 vreg, bool is_read,
     return true;
 }
 
-bool hv_sprr_handle_eret(struct exc_info *ctx, bool locked)
+static bool hv_sprr_handle_eret_locked(struct exc_info *ctx, bool locked)
 {
     struct hv_sprr_cpu *cpu = hv_sprr_this();
     struct hv_sprr_exc_regs *regs = &cpu->exc[cpu->context];
@@ -1871,4 +1877,65 @@ void hv_sprr_init(void)
         sprr_init_cpu(i);
     if (hv_map_hw_ro((u64)hv_sprr_vectors, (u64)hv_sprr_vectors, SZ_16K) < 0)
         panic("hv_sprr: cannot map vector page");
+}
+
+bool hv_sprr_is_pt_page(u64 ipa)
+{
+    spin_lock(&sprr_lock);
+    bool ret = hv_sprr_is_pt_page_locked(ipa);
+    spin_unlock(&sprr_lock);
+    return ret;
+}
+
+bool hv_sprr_is_shadow_page(u64 ipa)
+{
+    spin_lock(&sprr_lock);
+    bool ret = hv_sprr_is_shadow_page_locked(ipa);
+    spin_unlock(&sprr_lock);
+    return ret;
+}
+
+bool hv_sprr_is_commpage(u64 ipa)
+{
+    spin_lock(&sprr_lock);
+    bool ret = hv_sprr_is_commpage_locked(ipa);
+    spin_unlock(&sprr_lock);
+    return ret;
+}
+
+void hv_sprr_commpage_updated(u64 ipa, u64 bytes)
+{
+    spin_lock(&sprr_lock);
+    hv_sprr_commpage_updated_locked(ipa, bytes);
+    spin_unlock(&sprr_lock);
+}
+
+void hv_sprr_pt_writer_check(struct exc_info *ctx, u64 ipa, u64 far)
+{
+    spin_lock(&sprr_lock);
+    hv_sprr_pt_writer_check_locked(ctx, ipa, far);
+    spin_unlock(&sprr_lock);
+}
+
+void hv_sprr_pt_updated(struct exc_info *ctx, u64 ipa, u64 bytes)
+{
+    spin_lock(&sprr_lock);
+    hv_sprr_pt_updated_locked(ctx, ipa, bytes);
+    spin_unlock(&sprr_lock);
+}
+
+bool hv_sprr_handle_msr(struct exc_info *ctx, u64 reg, u32 rt, bool is_read)
+{
+    spin_lock(&sprr_lock);
+    bool ret = hv_sprr_handle_msr_locked(ctx, reg, rt, is_read);
+    spin_unlock(&sprr_lock);
+    return ret;
+}
+
+bool hv_sprr_handle_eret(struct exc_info *ctx, bool locked)
+{
+    spin_lock(&sprr_lock);
+    bool ret = hv_sprr_handle_eret_locked(ctx, locked);
+    spin_unlock(&sprr_lock);
+    return ret;
 }

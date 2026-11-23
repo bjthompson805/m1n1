@@ -40,6 +40,9 @@ struct hv_evt_irqtrace {
     u16 num;
 };
 
+/* XXX M5 debug: console prints from guest secondaries (suspected of breaking the proxy stream) */
+#define HV_DBG_SECONDARY 0
+
 #define HV_MAX_RW_SIZE  64
 #define HV_MAX_RW_WORDS (HV_MAX_RW_SIZE >> 3)
 

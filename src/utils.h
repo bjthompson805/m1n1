@@ -291,7 +291,7 @@ static inline void write64_lo_hi(u64 addr, u64 val)
 
 #define reg_clr(reg, bits)      _msr(sr_tkn(reg), _mrs(sr_tkn(reg)) & ~(bits))
 #define reg_set(reg, bits)      _msr(sr_tkn(reg), _mrs(sr_tkn(reg)) | bits)
-#define reg_mask(reg, clr, set) _msr(sr_tkn(reg), (_mrs(sr_tkn(reg)) & ~(clr)) | set)
+#define reg_mask(reg, clr, set) _msr(sr_tkn(reg), (_mrs(sr_tkn(reg)) & ~(clr)) | (set))
 
 #define reg_clr_sync(reg, bits)                                                                    \
     ({                                                                                             \

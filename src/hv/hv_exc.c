@@ -687,7 +687,8 @@ bool hv_exc_sync(struct exc_info *ctx)
          * the console from several secondaries at once wedged the USB console (cpus=7/10 runs).
          */
         static int dbg_sec_exc[MAX_CPUS];
-        if (smp_id() == 0 && smp_id() != boot_cpu_idx && dbg_sec_exc[smp_id()]++ < 64) {
+        if (HV_DBG_SECONDARY && smp_id() == 0 && smp_id() != boot_cpu_idx &&
+            dbg_sec_exc[smp_id()]++ < 64) {
             printf("HVDBG: cpu%d exc %d esr=0x%lx elr=0x%lx far=0x%lx spsr=0x%lx\n", smp_id(),
                    dbg_sec_exc[smp_id()], ctx->esr, ctx->elr, ctx->far, ctx->spsr);
             iodev_console_flush();
@@ -717,7 +718,7 @@ bool hv_exc_sync(struct exc_info *ctx)
              */
             {
                 static int dbg_wfi; // XXX M5 debug
-                if (dbg_wfi++ < 4) {
+                if (HV_DBG_SECONDARY && dbg_wfi++ < 4) {
                     printf("HVDBG: cpu%d guest WFI elr=0x%lx\n", smp_id(), ctx->elr);
                     iodev_console_flush();
                 }
@@ -834,6 +835,14 @@ void hv_exc_fiq(struct exc_info *ctx)
 
     hv_maybe_exit();
     if (dbg) { printf("HVDBG: fiq 1 (line 4)\n"); iodev_console_flush(); }
+    {
+        static int dbg_sec_fiq; // XXX M5 debug: the first guest secondary's first FIQs
+        if (HV_DBG_SECONDARY && smp_id() == 0 && smp_id() != boot_cpu_idx && dbg_sec_fiq++ < 8) {
+            printf("HVDBG: cpu0 fiq %d elr=0x%lx cntp_ctl=0x%lx cntv_ctl=0x%lx isr=0x%lx\n",
+                   dbg_sec_fiq, ctx->elr, mrs(CNTP_CTL_EL0), mrs(CNTV_CTL_EL0), mrs(ISR_EL1));
+            iodev_console_flush();
+        }
+    }
 
     if (mrs(CNTP_CTL_EL0) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
         msr(CNTP_CTL_EL0, CNTx_CTL_ISTATUS | CNTx_CTL_IMASK | CNTx_CTL_ENABLE);
