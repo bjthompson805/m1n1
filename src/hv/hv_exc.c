@@ -681,6 +681,16 @@ bool hv_exc_sync(struct exc_info *ctx)
 
     bool do_gexit = false;
 
+    {
+        /* XXX M5 debug: a guest secondary's first exceptions, before anything can reset */
+        static int dbg_sec_exc[MAX_CPUS];
+        if (smp_id() != boot_cpu_idx && dbg_sec_exc[smp_id()]++ < 64) {
+            printf("HVDBG: cpu%d exc %d esr=0x%lx elr=0x%lx far=0x%lx spsr=0x%lx\n", smp_id(),
+                   dbg_sec_exc[smp_id()], ctx->esr, ctx->elr, ctx->far, ctx->spsr);
+            iodev_console_flush();
+        }
+    }
+
     switch (ec) {
         case ESR_EC_ERET:
             handled = hv_sprr_handle_eret(ctx, false);
