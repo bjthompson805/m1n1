@@ -3167,12 +3167,18 @@ int kboot_prepare_dt(void *fdt)
         // on the secondary (non-boot) cores. Add a reserved-memory region to
         // prevent Linux from crashing when allocating this memory and writing
         // to it from a secondary core.
-        u64 ro_start = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1);
-        u64 ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_C_UPR_EL1), SZ_4K);
+        // UPR is the start of the last protected page (inclusive), as for CTRR D below.
+        u64 ro_start = ALIGN_DOWN(mrs(SYS_IMP_APL_CTRR_C_LWR_EL1), get_page_size());
+        u64 ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_C_UPR_EL1) + SZ_4K, get_page_size());
         if (ro_end - ro_start > 12 * SZ_4K)
             printf("WARNING: M4+ SMP-RO is large (48KB)");
         if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
             bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
+        // U-Boot turns /memreserve/ into EFI boot services data, which an EFI OS
+        // reclaims after ExitBootServices; a no-map node becomes EFI reserved memory.
+        if (dt_get_or_add_reserved_mem("ctrr-c", "apple,ctrr-protected", true, ro_start,
+                                       ro_end - ro_start) < 0)
+            return -1;
 
         // M5 (T8142) has a second such instance (CTRR D) left enabled on the
         // secondaries, as GravityLinux/bootloader #19 found; a secondary
@@ -3188,6 +3194,9 @@ int kboot_prepare_dt(void *fdt)
 
                 if (fdt_add_mem_rsv(dt, d_start, d_end - d_start))
                     bail("FDT: couldn't reserve the T8142 CTRR D range\n");
+                if (dt_get_or_add_reserved_mem("ctrr-d", "apple,ctrr-protected", true, d_start,
+                                               d_end - d_start) < 0)
+                    return -1;
             }
         }
     }
