@@ -1442,8 +1442,14 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         return;
 
     u8 ep = dev->pipe[pipe].ep_in;
+    u64 start = get_ticks();
+    u64 timeout = mrs(CNTFRQ_EL0); /* One second. */
 
-    while (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress) {
+    /* A stalled host must not hold the shared USB controller lock indefinitely. */
+    while (dev->pipe[pipe].ready &&
+           (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress)) {
+        if (get_ticks() - start >= timeout)
+            break;
         usb_dwc3_handle_events(dev);
     }
 }

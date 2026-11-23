@@ -397,7 +397,9 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     HV_CRUMB(99);
 }
 
-static void hv_enter_secondary(void *entry, u64 regs[4])
+static u64 hv_secondary_guest_regs[MAX_CPUS][4];
+
+static void hv_enter_secondary(void *entry, const u64 regs[4])
 {
     /*
      * Mark the CPU as running a guest only now, from the CPU itself: until here it is parked in
@@ -443,7 +445,13 @@ void hv_start_secondary(int cpu, void *entry, u64 regs[4])
     printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
 
     iodev_console_flush();
-    if (!smp_take_call4_timeout(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0, 1000000)) {
+    /*
+     * The spin-table acknowledgement lets the proxy request return before
+     * hv_enter_secondary reads these arguments. Keep a copy owned by the CPU.
+     */
+    memcpy(hv_secondary_guest_regs[cpu], regs, sizeof(hv_secondary_guest_regs[cpu]));
+    if (!smp_take_call4_timeout(cpu, hv_enter_secondary, (u64)entry,
+                               (u64)hv_secondary_guest_regs[cpu], 0, 0, 1000000)) {
         printf("HV: secondary %d never entered the guest; leaving it out\n", cpu);
         hv_started_cpus[cpu] = false;
         __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(cpu), __ATOMIC_ACQUIRE);
@@ -594,8 +602,10 @@ void hv_tick(struct exc_info *ctx)
 {
     static int dbg_ticks; // XXX M5 debug
     bool dbg = dbg_ticks++ < 3;
-    if (dbg)
-        printf("HVDBG: tick %d: wdt_pet\n", dbg_ticks); iodev_console_flush();
+    if (dbg) {
+        printf("HVDBG: tick %d: wdt_pet\n", dbg_ticks);
+        iodev_console_flush();
+    }
     hv_wdt_pet();
     // XXX M5 dev loop: the host arms the primary WDT with a short alarm; keep it from firing
     // while the HV ticks, for at most HV_HW_WDT_MAX_S. A frozen machine (no ticks) then resets
@@ -609,22 +619,30 @@ void hv_tick(struct exc_info *ctx)
         if (now - first_tick < HV_HW_WDT_MAX_S * mrs(CNTFRQ_EL0))
             wdt_kick();
     }
-    if (dbg)
-        printf("HVDBG: tick: usb events\n"); iodev_console_flush();
+    if (dbg) {
+        printf("HVDBG: tick: usb events\n");
+        iodev_console_flush();
+    }
     iodev_handle_events(uartproxy_iodev);
-    if (dbg)
-        printf("HVDBG: tick: can_read\n"); iodev_console_flush();
+    if (dbg) {
+        printf("HVDBG: tick: can_read\n");
+        iodev_console_flush();
+    }
     if (iodev_can_read(uartproxy_iodev)) {
         printf("HV: User interrupt\n");
         iodev_console_flush();
         if (hv_pinned_cpu == -1 || hv_pinned_cpu == smp_id())
             hv_exc_proxy(ctx, START_HV, HV_USER_INTERRUPT, NULL);
     }
-    if (dbg)
-        printf("HVDBG: tick: vuart\n"); iodev_console_flush();
+    if (dbg) {
+        printf("HVDBG: tick: vuart\n");
+        iodev_console_flush();
+    }
     hv_vuart_poll();
-    if (dbg)
-        printf("HVDBG: tick done\n"); iodev_console_flush();
+    if (dbg) {
+        printf("HVDBG: tick done\n");
+        iodev_console_flush();
+    }
 }
 
 bool hv_is_nested(void)
