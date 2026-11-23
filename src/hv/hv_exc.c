@@ -363,6 +363,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         SYSREG_TMR_CTL(SYS_CNTP_CTL_EL0, SYS_CNTP_CTL_EL02, VM_TMR_FIQ_ENA_ENA_P)
         SYSREG_MAP(SYS_CNTP_CVAL_EL0, SYS_CNTP_CVAL_EL02)
         SYSREG_MAP(SYS_CNTP_TVAL_EL0, SYS_CNTP_TVAL_EL02)
+        /* M5: xnu reads these hundreds of times a second (only trapped with HCR_EL2.TIDCP) */
+        case SYSREG_ISS(SYS_IMP_APL_SIQ_CFG_EL1):
+            if (!is_read)
+                return false; /* rare: let the proxy log (and pass) writes */
+            regs[rt] = mrs(SYS_IMP_APL_SIQ_CFG_EL1);
+            return true;
+        SYSREG_PASS(sys_reg(3, 4, 15, 11, 7));
         /* Spammy stuff seen on t600x p-cores */
         /* These are PMU/PMC registers */
         SYSREG_PASS(sys_reg(3, 2, 15, 12, 0));

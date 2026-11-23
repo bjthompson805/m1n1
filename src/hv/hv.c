@@ -340,7 +340,8 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     msr(VBAR_EL1, _hv_vectors_start);
 
     /* T8142 secondaries can't WFI without losing state (see ESR_EC_WFI in hv_exc.c) */
-    msr(HCR_EL2, info->hcr | (chip_id == T8142 ? HCR_TWI : 0));
+    msr(HCR_EL2, info->hcr | (chip_id == T8142 ? HCR_TWI : 0) |
+                     (HV_TRACE_SECONDARY_SYSREGS ? HCR_TIDCP : 0));
     msr(HACR_EL2, info->hacr);
     msr(VTCR_EL2, info->vtcr);
     msr(VTTBR_EL2, info->vttbr);

@@ -42,6 +42,10 @@ struct hv_evt_irqtrace {
 
 /* XXX M5 debug: console prints from guest secondaries (suspected of breaking the proxy stream) */
 #define HV_DBG_SECONDARY 0
+/* XXX M5 debug: trap implementation-defined sysregs (HCR_EL2.TIDCP) on guest secondaries only */
+#ifndef HV_TRACE_SECONDARY_SYSREGS
+#define HV_TRACE_SECONDARY_SYSREGS 0
+#endif
 
 #define HV_MAX_RW_SIZE  64
 #define HV_MAX_RW_WORDS (HV_MAX_RW_SIZE >> 3)
