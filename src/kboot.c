@@ -3173,6 +3173,23 @@ int kboot_prepare_dt(void *fdt)
             printf("WARNING: M4+ SMP-RO is large (48KB)");
         if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
             bail("FDT: couldn't add reservation for M4+ SMP-RO CTRR area\n");
+
+        // M5 (T8142) has a second such instance (CTRR D) left enabled on the
+        // secondaries, as GravityLinux/bootloader #19 found; a secondary
+        // writing into it faults. It reads back zero on some chainloaded paths.
+        if (chip_id == T8142) {
+            u64 d_lower = mrs(SYS_IMP_APL_CTRR_D_LWR_EL1);
+            u64 d_upper = mrs(SYS_IMP_APL_CTRR_D_UPR_EL1);
+
+            printf("FDT: T8142 CTRR D %#lx..%#lx\n", d_lower, d_upper);
+            if (d_lower && d_upper >= d_lower) {
+                u64 d_start = ALIGN_DOWN(d_lower, get_page_size());
+                u64 d_end = ALIGN_UP(d_upper + SZ_4K, get_page_size());
+
+                if (fdt_add_mem_rsv(dt, d_start, d_end - d_start))
+                    bail("FDT: couldn't reserve the T8142 CTRR D range\n");
+            }
+        }
     }
 
     /* setup console log buffer early to capture as much log as possible */
