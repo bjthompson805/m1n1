@@ -27,7 +27,8 @@
 #define USE_DEBUG_USB 0
 
 #ifdef RELEASE
-# define FB_SILENT_MODE
+// Release builds keep the framebuffer console (FB_SILENT_MODE left off): the
+// stub's proxy is driven remotely and the screen should show what it is doing.
 # ifdef CHAINLOADING
 #  define EARLY_PROXY_TIMEOUT 5
 # endif
