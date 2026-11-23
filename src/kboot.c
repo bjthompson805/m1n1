@@ -2488,8 +2488,10 @@ static int dt_set_sep(void)
         bail("ADT: could not get sepfw memory\n");
 
     const char *node_name = "sep-firmware";
+    // no-map: without it U-Boot hands the range to the OS as EFI boot services
+    // data, which FreeBSD reclaims as RAM while SEP is still running from it.
     int mem_node =
-        dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", false, phys_map[0], phys_map[1]);
+        dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, phys_map[0], phys_map[1]);
     if (mem_node < 0)
         bail("FDT: failed to reserve sepfw");
 
