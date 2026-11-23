@@ -129,6 +129,12 @@ bool timeout_expired(u64 timeout)
 void flush_and_reboot(void)
 {
     iodev_console_flush();
+#ifdef REBOOT_DELAY_SEC
+    // Debug builds: keep the message on screen long enough to read.
+    printf("Rebooting in %d s...\n", REBOOT_DELAY_SEC);
+    iodev_console_flush();
+    udelay(REBOOT_DELAY_SEC * 1000000);
+#endif
     reboot();
 }
 
