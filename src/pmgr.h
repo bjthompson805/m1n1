@@ -34,6 +34,19 @@ int pmgr_power_on(int die, const char *name);
 
 int pmgr_set_mode(uintptr_t addr, u8 target_mode);
 
+struct pmgr_saved_mode {
+    uintptr_t addr;
+    u8 target;
+};
+
+struct pmgr_saved_modes {
+    struct pmgr_saved_mode modes[64];
+    size_t count;
+};
+
+int pmgr_adt_power_enable_saved(const char *path, struct pmgr_saved_modes *saved);
+void pmgr_restore_modes(struct pmgr_saved_modes *saved);
+
 u32 pmgr_get_feature(const char *name);
 
 int pmgr_set_voltage_ctl(uint32_t offset);

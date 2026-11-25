@@ -290,6 +290,70 @@ int pmgr_adt_power_disable_index(const char *path, u32 index)
     return pmgr_adt_device_set_mode(path, index, PMGR_PS_PWRGATE, false);
 }
 
+/*
+ * From aura: power a device and its parents up, saving each PS word's target first so a failed
+ * bring-up (the ISP17a) can put them back as the boot firmware left them.
+ */
+#define PMGR_MAX_PARENT_DEPTH 16
+
+static int pmgr_save_parents(u8 die, u16 id, struct pmgr_saved_modes *saved, size_t depth)
+{
+    const struct pmgr_device *device;
+    if (depth >= PMGR_MAX_PARENT_DEPTH || pmgr_find_device(id, &device))
+        return -1;
+    u16 parents[2];
+    pmgr_adt_get_parents(device, parents);
+    for (size_t i = 0; i < ARRAY_SIZE(parents); i++)
+        if (parents[i] && pmgr_save_parents(die, parents[i], saved, depth + 1))
+            return -1;
+    if (device->flags & PMGR_FLAG_VIRTUAL)
+        return 0;
+    uintptr_t addr = pmgr_device_get_addr(die, device);
+    if (!addr)
+        return -1;
+    for (size_t i = 0; i < saved->count; i++)
+        if (saved->modes[i].addr == addr)
+            return 0;
+    if (saved->count == ARRAY_SIZE(saved->modes))
+        return -1;
+    saved->modes[saved->count++] = (struct pmgr_saved_mode){
+        .addr = addr,
+        .target = FIELD_GET(PMGR_PS_TARGET, read32(addr)),
+    };
+    return 0;
+}
+
+void pmgr_restore_modes(struct pmgr_saved_modes *saved)
+{
+    while (saved->count) {
+        struct pmgr_saved_mode *entry = &saved->modes[--saved->count];
+        u32 reg = read32(entry->addr);
+        if ((FIELD_GET(PMGR_PS_ACTUAL, reg) != entry->target ||
+             FIELD_GET(PMGR_PS_TARGET, reg) != entry->target) &&
+            pmgr_set_mode(entry->addr, entry->target))
+            printf("pmgr: failed to restore 0x%lx to its saved mode\n", entry->addr);
+    }
+}
+
+int pmgr_adt_power_enable_saved(const char *path, struct pmgr_saved_modes *saved)
+{
+    const u32 *devices;
+    u32 n_devices;
+    if (pmgr_adt_find_devices(path, &devices, &n_devices))
+        return -1;
+    saved->count = 0;
+    for (u32 i = 0; i < n_devices; i++) {
+        u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
+        if (pmgr_save_parents(die, id, saved, 0))
+            return -1;
+    }
+    if (!pmgr_adt_power_enable(path))
+        return 0;
+    pmgr_restore_modes(saved);
+    return -1;
+}
+
 static int pmgr_reset_device(int die, const struct pmgr_device *dev)
 {
     if (die < 0 || die > 16) {
