@@ -3252,9 +3252,11 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_setup_sio())
         return -1;
-    /* An ISP17a's firmware is resident (iBoot's); only the heap goes in the DT (as aura). */
-    if (!isp_is_isp17a() &&
-        dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base(), 0))
+    /*
+     * An ISP17a's firmware is resident (iBoot's). aura hands over only the heap; FreeBSD's
+     * apple_isp also needs the segments reserved, to map them into DARTs iBoot leaves bare.
+     */
+    if (dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base(), 0))
         return -1;
     if (dt_set_isp_fwdata())
         return -1;
